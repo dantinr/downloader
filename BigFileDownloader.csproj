@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**</DefaultItemExcludes>
+    <AssemblyName>downloader</AssemblyName>
+    <RootNamespace>BigFileDownloader</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/VERSION').Trim())</Version>
+    <Authors>downloader</Authors>
+    <Description>支持分块并发和断点续传的 Windows 大文件下载器</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/dantinr/downloader</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishSingleFile>true</PublishSingleFile>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <Target Name="ValidateProjectVersion" BeforeTargets="PrepareForBuild">
+    <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Version)', '^[0-9]+\.[0-9]+\.[1-9][0-9]$')) != 'True'"
+           Text="VERSION 必须使用 x.x.xx 格式，末段范围为 10-99，例如 0.0.10。" />
+  </Target>
+
+  <ItemGroup>
+    <None Update="LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="VERSION" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
