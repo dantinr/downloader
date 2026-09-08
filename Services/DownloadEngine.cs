@@ -48,50 +48,6 @@ internal sealed class DownloadEngine : IDisposable
         }
 
         DiagnosticLog.Info("Engine", $"Probe started; url={DiagnosticLog.SafeUrl(url)}");
-        long? totalBytes = null;
-        string? etag = null;
-        DateTimeOffset? lastModified = null;
-        ContentDispositionHeaderValue? disposition = null;
-        var finalUri = uri;
-
-        try
-        {
-            using var headTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            headTimeout.CancelAfter(TimeSpan.FromSeconds(10));
-            using var headRequest = CreateRequest(HttpMethod.Head, uri);
-            using var headResponse = await _client.SendAsync(
-                headRequest,
-                HttpCompletionOption.ResponseHeadersRead,
-                headTimeout.Token);
-
-            if (headResponse.IsSuccessStatusCode)
-            {
-                totalBytes = headResponse.Content.Headers.ContentLength;
-                etag = headResponse.Headers.ETag?.ToString();
-                lastModified = headResponse.Content.Headers.LastModified;
-                disposition = headResponse.Content.Headers.ContentDisposition;
-                finalUri = headResponse.RequestMessage?.RequestUri ?? finalUri;
-            }
-            else
-            {
-                DiagnosticLog.Warning(
-                    "Engine",
-                    $"HEAD probe returned {(int)headResponse.StatusCode}; url={DiagnosticLog.SafeUrl(url)}");
-            }
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            DiagnosticLog.Warning("Engine", $"HEAD probe timed out; url={DiagnosticLog.SafeUrl(url)}");
-            // Some servers reject or stall HEAD. The range probe below is authoritative.
-        }
-        catch (HttpRequestException exception)
-        {
-            DiagnosticLog.Warning(
-                "Engine",
-                $"HEAD probe failed; url={DiagnosticLog.SafeUrl(url)}; error={exception.Message}");
-            // Fall through to the GET range probe.
-        }
-
         using var rangeRequest = CreateRequest(HttpMethod.Get, uri);
         rangeRequest.Headers.Range = new RangeHeaderValue(0, 0);
         using var rangeResponse = await _client.SendAsync(
@@ -111,13 +67,12 @@ internal sealed class DownloadEngine : IDisposable
         }
 
         var supportsRanges = rangeResponse.StatusCode == HttpStatusCode.PartialContent;
-        totalBytes = rangeResponse.Content.Headers.ContentRange?.Length
-            ?? totalBytes
+        var totalBytes = rangeResponse.Content.Headers.ContentRange?.Length
             ?? rangeResponse.Content.Headers.ContentLength;
-        etag = rangeResponse.Headers.ETag?.ToString() ?? etag;
-        lastModified = rangeResponse.Content.Headers.LastModified ?? lastModified;
-        disposition = rangeResponse.Content.Headers.ContentDisposition ?? disposition;
-        finalUri = rangeResponse.RequestMessage?.RequestUri ?? finalUri;
+        var etag = rangeResponse.Headers.ETag?.ToString();
+        var lastModified = rangeResponse.Content.Headers.LastModified;
+        var disposition = rangeResponse.Content.Headers.ContentDisposition;
+        var finalUri = rangeResponse.RequestMessage?.RequestUri ?? uri;
 
         DiagnosticLog.Info(
             "Engine",
@@ -147,12 +102,14 @@ internal sealed class DownloadEngine : IDisposable
             $"requestedSegments={job.SegmentCount}; existingBytes={job.DownloadedBytes}");
         job.State = DownloadState.Inspecting;
         job.Message = "正在检查服务器";
+        var previousTotalBytes = job.TotalBytes;
         var previousEtag = job.ETag;
         var previousLastModified = job.LastModified;
         var hadPartialData = HasPartialData(job);
+        var sourceUri = new Uri(job.Url, UriKind.Absolute);
         var probe = await ProbeAsync(job.Url, cancellationToken);
 
-        if (hadPartialData && RemoteFileChanged(previousEtag, previousLastModified, probe))
+        if (hadPartialData && RemoteFileChanged(previousTotalBytes, previousEtag, previousLastModified, probe))
         {
             DiagnosticLog.Warning("Engine", $"Remote file changed; job={job.Id:N}");
             throw new InvalidOperationException("远端文件已经变化。请删除旧任务后重新添加，避免文件损坏。");
@@ -192,13 +149,13 @@ internal sealed class DownloadEngine : IDisposable
         {
             job.Message = $"{job.SegmentCount} 路连接，支持断点续传";
             DiagnosticLog.Info("Engine", $"Using segmented mode; job={job.Id:N}; bytes={probe.TotalBytes}");
-            await DownloadSegmentedAsync(job, probe.FinalUri, progress, cancellationToken);
+            await DownloadSegmentedAsync(job, sourceUri, progress, cancellationToken);
         }
         else
         {
             job.Message = "服务器不支持 Range，使用单连接下载";
             DiagnosticLog.Info("Engine", $"Using single-stream mode; job={job.Id:N}; bytes={probe.TotalBytes}");
-            await DownloadSingleAsync(job, probe.FinalUri, progress, cancellationToken);
+            await DownloadSingleAsync(job, sourceUri, progress, cancellationToken);
         }
     }
 
@@ -603,6 +560,7 @@ internal sealed class DownloadEngine : IDisposable
     }
 
     private static bool RemoteFileChanged(
+        long? previousTotalBytes,
         string? previousEtag,
         DateTimeOffset? previousLastModified,
         DownloadProbe probe)
@@ -613,9 +571,16 @@ internal sealed class DownloadEngine : IDisposable
             return !string.Equals(previousEtag, probe.ETag, StringComparison.Ordinal);
         }
 
-        return previousLastModified is not null
+        if (previousLastModified is not null
             && probe.LastModified is not null
-            && previousLastModified.Value != probe.LastModified.Value;
+            && previousLastModified.Value != probe.LastModified.Value)
+        {
+            return true;
+        }
+
+        return previousTotalBytes is not null
+            && probe.TotalBytes is not null
+            && previousTotalBytes.Value != probe.TotalBytes.Value;
     }
 
     private static bool HasPartialData(DownloadJob job)

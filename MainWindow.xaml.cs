@@ -226,6 +226,37 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void UpdateLinkButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (SelectedJob() is not { State: DownloadState.Pending or DownloadState.Paused or DownloadState.Failed } job)
+        {
+            return;
+        }
+
+        var url = UrlBox.Text.Trim();
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+        {
+            MessageBox.Show(
+                "请先在下载地址输入框粘贴新的 HTTP 或 HTTPS 地址。",
+                "无法更新链接",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            UrlBox.Focus();
+            return;
+        }
+
+        DiagnosticLog.Info(
+            "UI",
+            $"Task URL updated; job={job.Id:N}; old={DiagnosticLog.SafeUrl(job.Url)}; new={DiagnosticLog.SafeUrl(url)}");
+        job.Url = url;
+        job.State = DownloadState.Pending;
+        job.Message = "链接已更新，正在验证并继续";
+        UrlBox.Clear();
+        MarkDirty();
+        UpdateUiState();
+        await StartJobAsync(job);
+    }
+
     private void BrowseButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFolderDialog
@@ -484,6 +515,7 @@ public partial class MainWindow : Window
         PauseButton.IsEnabled = selected?.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging;
         ResumeButton.IsEnabled = selected?.State is DownloadState.Pending or DownloadState.Paused;
         RetryButton.IsEnabled = selected?.State == DownloadState.Failed;
+        UpdateLinkButton.IsEnabled = selected?.State is DownloadState.Pending or DownloadState.Paused or DownloadState.Failed;
         OpenButton.IsEnabled = selected is not null;
         RemoveButton.IsEnabled = selected is not null;
         ClearCompletedButton.IsEnabled = Jobs.Any(job => job.State == DownloadState.Completed);
@@ -514,8 +546,13 @@ public partial class MainWindow : Window
         return exception switch
         {
             UnauthorizedAccessException => "没有写入目标文件夹的权限",
-            HttpRequestException { StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden } => "服务器要求登录或下载链接已经失效",
+            HttpRequestException { StatusCode: HttpStatusCode.Unauthorized } =>
+                "服务器要求登录；当前版本不能读取浏览器的登录 Cookie",
+            HttpRequestException { StatusCode: HttpStatusCode.Forbidden } =>
+                "服务器拒绝请求（403）。链接可能已过期或受登录、来源页、并发限制；获取新链接后可更新任务并续传",
             HttpRequestException { StatusCode: HttpStatusCode.NotFound } => "服务器上没有找到该文件",
+            HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests } =>
+                "服务器限制请求频率；请降低并发连接数，稍后重试",
             HttpRequestException requestException => requestException.Message,
             IOException ioException => ioException.Message,
             _ => exception.Message

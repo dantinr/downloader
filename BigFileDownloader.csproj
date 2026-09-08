@@ -6,7 +6,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**;tests\**</DefaultItemExcludes>
     <AssemblyName>downloader</AssemblyName>
     <RootNamespace>BigFileDownloader</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
