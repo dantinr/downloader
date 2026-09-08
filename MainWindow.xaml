@@ -174,14 +174,14 @@
                             <DataGridTemplateColumn Header="文件" Width="2.2*" MinWidth="230">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <StackPanel VerticalAlignment="Center" ToolTip="{Binding Url}">
-                                            <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                                            <TextBlock Text="{Binding Message}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis" Margin="0,4,0,0" />
+                                        <StackPanel VerticalAlignment="Center" ToolTip="{Binding Url, Mode=OneWay}">
+                                            <TextBlock Text="{Binding FileName, Mode=OneWay}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding Message, Mode=OneWay}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis" Margin="0,4,0,0" />
                                         </StackPanel>
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
-                            <DataGridTextColumn Header="大小" Binding="{Binding SizeDisplay}" Width="100" />
+                            <DataGridTextColumn Header="大小" Binding="{Binding SizeDisplay, Mode=OneWay}" Width="100" />
                             <DataGridTemplateColumn Header="进度" Width="1.5*" MinWidth="170">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
@@ -192,27 +192,27 @@
                                                 <RowDefinition Height="Auto" />
                                             </Grid.RowDefinitions>
                                             <Grid>
-                                                <TextBlock Text="{Binding ProgressDisplay}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" />
-                                                <TextBlock Text="{Binding DownloadedDisplay}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Right" />
+                                                <TextBlock Text="{Binding ProgressDisplay, Mode=OneWay}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" />
+                                                <TextBlock Text="{Binding DownloadedDisplay, Mode=OneWay}" FontSize="11" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Right" />
                                             </Grid>
                                             <ProgressBar Grid.Row="2"
                                                          Minimum="0"
                                                          Maximum="100"
-                                                         Value="{Binding ProgressPercent}"
-                                                         IsIndeterminate="{Binding IsIndeterminate}" />
+                                                         Value="{Binding ProgressPercent, Mode=OneWay}"
+                                                         IsIndeterminate="{Binding IsIndeterminate, Mode=OneWay}" />
                                         </Grid>
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
-                            <DataGridTextColumn Header="速度" Binding="{Binding SpeedDisplay}" Width="105" />
-                            <DataGridTextColumn Header="剩余" Binding="{Binding EtaDisplay}" Width="85" />
-                            <DataGridTextColumn Header="连接" Binding="{Binding SegmentCount}" Width="64" />
+                            <DataGridTextColumn Header="速度" Binding="{Binding SpeedDisplay, Mode=OneWay}" Width="105" />
+                            <DataGridTextColumn Header="剩余" Binding="{Binding EtaDisplay, Mode=OneWay}" Width="85" />
+                            <DataGridTextColumn Header="连接" Binding="{Binding SegmentCount, Mode=OneWay}" Width="64" />
                             <DataGridTemplateColumn Header="状态" Width="90">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <TextBlock Text="{Binding StateDisplay}"
+                                        <TextBlock Text="{Binding StateDisplay, Mode=OneWay}"
                                                    FontWeight="SemiBold"
-                                                   Foreground="{Binding State, Converter={StaticResource StateBrushConverter}}" />
+                                                   Foreground="{Binding State, Mode=OneWay, Converter={StaticResource StateBrushConverter}}" />
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>

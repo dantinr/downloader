@@ -4,6 +4,9 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using BigFileDownloader.Models;
@@ -222,6 +225,23 @@ static void TestUiRendering(string testRoot, string outputDirectory)
             application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             Directory.CreateDirectory(outputDirectory);
 
+            var mainWindow = new BigFileDownloader.MainWindow();
+            mainWindow.Jobs.Add(new DownloadJob
+            {
+                FileName = "existing-download.bin",
+                DestinationFolder = KnownFolders.DownloadsDirectory,
+                TotalBytes = 1_000,
+                DownloadedBytes = 500,
+                State = DownloadState.Paused,
+                Message = "已保留分块，可继续下载"
+            });
+            RenderWindow(mainWindow, Path.Combine(outputDirectory, "main-with-existing-task.png"));
+            var progressBar = FindVisualDescendant<ProgressBar>(mainWindow.QueueGrid)
+                ?? throw new InvalidOperationException("FAIL: the download progress bar was not rendered");
+            var progressBinding = BindingOperations.GetBinding(progressBar, RangeBase.ValueProperty);
+            Assert(progressBinding?.Mode == BindingMode.OneWay,
+                "read-only download progress is bound one-way");
+
             var acceptedDirectory = Path.Combine(testRoot, "accepted-downloads");
             string? persistedDirectory = null;
             var acceptedSettings = new SettingsWindow(
@@ -284,7 +304,27 @@ static void TestUiRendering(string testRoot, string outputDirectory)
         throw new InvalidOperationException("FAIL: settings/about windows could not be rendered", failure);
     }
 
-    Console.WriteLine($"  ok: settings and about windows render to {outputDirectory}");
+    Console.WriteLine($"  ok: application windows render with safe one-way bindings to {outputDirectory}");
+}
+
+static T? FindVisualDescendant<T>(DependencyObject root)
+    where T : DependencyObject
+{
+    for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+    {
+        var child = VisualTreeHelper.GetChild(root, index);
+        if (child is T match)
+        {
+            return match;
+        }
+
+        if (FindVisualDescendant<T>(child) is { } descendant)
+        {
+            return descendant;
+        }
+    }
+
+    return null;
 }
 
 static void RenderWindow(Window window, string outputPath)
