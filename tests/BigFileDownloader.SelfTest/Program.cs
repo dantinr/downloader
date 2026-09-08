@@ -1,8 +1,14 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using BigFileDownloader.Models;
 using BigFileDownloader.Services;
+using BigFileDownloader.Views;
 
 var root = Path.Combine(Path.GetTempPath(), $"downloader-selftest-{Guid.NewGuid():N}");
 Directory.CreateDirectory(root);
@@ -12,6 +18,9 @@ try
     await TestExpiringRedirectAsync(root);
     TestRemoteIdentityComparison();
     await TestPartialMergeAsync(root);
+    await TestSettingsStoreAsync(root);
+    TestAppInfo();
+    TestUiRendering(root, Path.Combine(Environment.CurrentDirectory, "artifacts", "ui-review"));
     Console.WriteLine("PASS: all self-tests completed.");
 }
 finally
@@ -149,6 +158,176 @@ static void TestRemoteIdentityComparison()
         "a changed file size is rejected even when the ETag is reused");
 
     Console.WriteLine("  ok: refreshed links retain their original content identity");
+}
+
+static async Task TestSettingsStoreAsync(string root)
+{
+    var settingsPath = Path.Combine(root, "settings", "settings.json");
+    var store = new SettingsStore(settingsPath);
+    var defaults = await store.LoadAsync();
+    Assert(defaults.SchemaVersion == AppSettings.CurrentSchemaVersion,
+        "missing settings use the current schema");
+    Assert(Path.IsPathFullyQualified(defaults.DefaultDownloadDirectory),
+        "missing settings use an absolute Downloads directory");
+
+    var configuredDirectory = Path.Combine(root, "configured-downloads");
+    await store.SaveAsync(new AppSettings { DefaultDownloadDirectory = configuredDirectory });
+    var restored = await store.LoadAsync();
+    Assert(restored.DefaultDownloadDirectory == Path.GetFullPath(configuredDirectory),
+        "the default download directory survives a settings round trip");
+
+    await AssertThrowsAsync<ArgumentException>(
+        () => store.SaveAsync(new AppSettings { DefaultDownloadDirectory = "relative\\downloads" }),
+        "relative default download directories are rejected");
+
+    const string futureSettings =
+        "{\"schemaVersion\":99,\"defaultDownloadDirectory\":\"C:\\\\future-downloads\"}";
+    await File.WriteAllTextAsync(settingsPath, futureSettings);
+    var futureFallback = await store.LoadAsync();
+    Assert(futureFallback.DefaultDownloadDirectory == KnownFolders.DownloadsDirectory,
+        "an unknown settings schema falls back to Downloads");
+    Assert(await File.ReadAllTextAsync(settingsPath) == futureSettings,
+        "an unknown settings schema is not overwritten");
+
+    const string invalidSettings = "{not-valid-json";
+    await File.WriteAllTextAsync(settingsPath, invalidSettings);
+    var invalidFallback = await store.LoadAsync();
+    Assert(invalidFallback.DefaultDownloadDirectory == KnownFolders.DownloadsDirectory,
+        "invalid settings fall back to Downloads");
+    Assert(await File.ReadAllTextAsync(settingsPath) == invalidSettings,
+        "invalid settings are preserved for diagnostics");
+
+    Console.WriteLine("  ok: default download settings persist and fail safely");
+}
+
+static void TestAppInfo()
+{
+    Assert(AppInfo.Version.Split('.').Length == 3 && !AppInfo.Version.Contains('+'),
+        "the displayed version is a three-part assembly version without build metadata");
+    Assert(AppInfo.WindowTitle == $"downloader {AppInfo.Version}",
+        "the main window title includes the application version");
+
+    Console.WriteLine("  ok: application title and about data use the packaged version");
+}
+
+static void TestUiRendering(string testRoot, string outputDirectory)
+{
+    Exception? failure = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            var application = new BigFileDownloader.App();
+            application.InitializeComponent();
+            application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Directory.CreateDirectory(outputDirectory);
+
+            var acceptedDirectory = Path.Combine(testRoot, "accepted-downloads");
+            string? persistedDirectory = null;
+            var acceptedSettings = new SettingsWindow(
+                acceptedDirectory,
+                directory =>
+                {
+                    persistedDirectory = directory;
+                    return Task.CompletedTask;
+                });
+            Assert(acceptedSettings.TrySaveAsync().GetAwaiter().GetResult(),
+                "the settings window accepts a valid directory after persistence succeeds");
+            Assert(persistedDirectory == Path.GetFullPath(acceptedDirectory),
+                "the settings window persists the normalized directory before closing");
+            acceptedSettings.Close();
+
+            var rejectedSettings = new SettingsWindow(
+                Path.Combine(testRoot, "rejected-downloads"),
+                _ => Task.FromException(new IOException("simulated settings write failure")))
+            {
+                Width = 400,
+                Height = 260
+            };
+            Assert(!rejectedSettings.TrySaveAsync().GetAwaiter().GetResult(),
+                "the settings window stays open when persistence fails");
+            Assert(rejectedSettings.FindName("ErrorText") is System.Windows.Controls.TextBlock
+            {
+                Visibility: Visibility.Visible
+            },
+                "a settings persistence failure is shown inline");
+
+            RenderWindow(
+                new SettingsWindow(Path.Combine(
+                    KnownFolders.DownloadsDirectory,
+                    "long-folder-name-for-layout-review",
+                    "downloads")),
+                Path.Combine(outputDirectory, "settings.png"));
+            RenderWindow(rejectedSettings, Path.Combine(outputDirectory, "settings-error-narrow.png"));
+            var aboutWindow = new AboutWindow();
+            RenderWindow(aboutWindow, Path.Combine(outputDirectory, "about.png"));
+            RenderWindow(
+                new AboutWindow
+                {
+                    Width = 480,
+                    Height = 300
+                },
+                Path.Combine(outputDirectory, "about-narrow.png"));
+            application.Shutdown();
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+
+    if (failure is not null)
+    {
+        throw new InvalidOperationException("FAIL: settings/about windows could not be rendered", failure);
+    }
+
+    Console.WriteLine($"  ok: settings and about windows render to {outputDirectory}");
+}
+
+static void RenderWindow(Window window, string outputPath)
+{
+    var content = window.Content as FrameworkElement
+        ?? throw new InvalidOperationException($"FAIL: {window.Title} has no renderable content");
+    var logicalWidth = window.Width;
+    var logicalHeight = window.Height;
+    content.Measure(new Size(logicalWidth, logicalHeight));
+    content.Arrange(new Rect(0, 0, logicalWidth, logicalHeight));
+    content.UpdateLayout();
+
+    var dpi = VisualTreeHelper.GetDpi(content);
+    var width = Math.Max(1, (int)Math.Ceiling(logicalWidth * dpi.DpiScaleX));
+    var height = Math.Max(1, (int)Math.Ceiling(logicalHeight * dpi.DpiScaleY));
+    var contentBitmap = new RenderTargetBitmap(
+        width,
+        height,
+        dpi.PixelsPerInchX,
+        dpi.PixelsPerInchY,
+        PixelFormats.Pbgra32);
+    contentBitmap.Render(content);
+
+    var surface = new DrawingVisual();
+    using (var drawingContext = surface.RenderOpen())
+    {
+        drawingContext.DrawRectangle(
+            window.Background ?? Brushes.White,
+            null,
+            new Rect(0, 0, logicalWidth, logicalHeight));
+        drawingContext.DrawImage(contentBitmap, new Rect(0, 0, logicalWidth, logicalHeight));
+    }
+
+    var bitmap = new RenderTargetBitmap(width, height, dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32);
+    bitmap.Render(surface);
+    var encoder = new PngBitmapEncoder();
+    encoder.Frames.Add(BitmapFrame.Create(bitmap));
+    using (var stream = File.Create(outputPath))
+    {
+        encoder.Save(stream);
+    }
+
+    Assert(new FileInfo(outputPath).Length > 1000, $"{window.Title} produces a non-empty UI snapshot");
 }
 
 static DownloadJob NewPartialJob(string targetPath, long totalBytes) => new()

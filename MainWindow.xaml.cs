@@ -8,6 +8,7 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using BigFileDownloader.Models;
 using BigFileDownloader.Services;
+using BigFileDownloader.Views;
 using Microsoft.Win32;
 
 namespace BigFileDownloader;
@@ -17,13 +18,19 @@ public partial class MainWindow : Window
     private readonly DownloadEngine _engine = new();
     private readonly DownloadQueueStore _store = new();
     private readonly PartialDownloadMergeService _mergeService = new();
+    private readonly SettingsStore _settingsStore = new();
+    private readonly SemaphoreSlim _queueSaveGate = new(1, 1);
     private readonly DispatcherTimer _saveTimer;
+    private AppSettings _settings = AppSettings.CreateDefault(KnownFolders.DownloadsDirectory);
+    private Task? _initializationTask;
     private bool _queueDirty;
     private bool _isLoaded;
+    private bool _isInitialized;
     private bool _isClosing;
     private bool _allowClose;
     private bool _saveInProgress;
     private bool _mergeInProgress;
+    private bool _dialogInProgress;
 
     public ObservableCollection<DownloadJob> Jobs { get; } = [];
 
@@ -31,9 +38,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         DataContext = this;
-        FolderBox.Text = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "Downloads");
+        Title = AppInfo.WindowTitle;
+        FolderBox.Text = _settings.DefaultDownloadDirectory;
 
         _saveTimer = new DispatcherTimer(TimeSpan.FromSeconds(3), DispatcherPriority.Background, SaveTimer_Tick, Dispatcher);
         UpdateUiState();
@@ -47,16 +53,63 @@ public partial class MainWindow : Window
         }
 
         _isLoaded = true;
-        var restoredJobs = await _store.LoadAsync();
+        UpdateUiState();
+        _initializationTask = InitializeAsync();
+        try
+        {
+            await _initializationTask;
+        }
+        catch (Exception exception)
+        {
+            DiagnosticLog.Error("UI", "Application data could not be initialized", exception);
+            if (!_isClosing)
+            {
+                MessageBox.Show(
+                    this,
+                    exception.Message,
+                    "无法加载应用数据",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+        finally
+        {
+            UpdateUiState();
+        }
+
+        if (_isInitialized && !_isClosing)
+        {
+            UrlBox.Focus();
+        }
+    }
+
+    private async Task InitializeAsync()
+    {
+        var settingsTask = _settingsStore.LoadAsync();
+        var queueTask = _store.LoadAsync();
+        await Task.WhenAll(settingsTask, queueTask);
+        _settings = await settingsTask;
+        FolderBox.Text = _settings.DefaultDownloadDirectory;
+        var restoredJobs = await queueTask;
         foreach (var job in restoredJobs.OrderByDescending(item => item.CreatedAt))
         {
             AttachJob(job);
             Jobs.Add(job);
         }
 
-        DiagnosticLog.Info("UI", $"Main window loaded; restoredJobs={Jobs.Count}");
-        UpdateUiState();
-        UrlBox.Focus();
+        _isInitialized = true;
+        DiagnosticLog.Info(
+            "UI",
+            $"Main window loaded; version={AppInfo.Version}; restoredJobs={Jobs.Count}; settingsSchema={_settings.SchemaVersion}");
+    }
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.OemComma && Keyboard.Modifiers == ModifierKeys.Control)
+        {
+            e.Handled = true;
+            ShowSettings();
+        }
     }
 
     private async void AddButton_Click(object sender, RoutedEventArgs e) => await AddDownloadAsync();
@@ -72,7 +125,7 @@ public partial class MainWindow : Window
 
     private async Task AddDownloadAsync()
     {
-        if (_mergeInProgress)
+        if (!_isInitialized || _mergeInProgress || _dialogInProgress)
         {
             return;
         }
@@ -542,6 +595,82 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SettingsButton_Click(object sender, RoutedEventArgs e) => ShowSettings();
+
+    private void ShowSettings()
+    {
+        if (!_isInitialized || _dialogInProgress || _mergeInProgress)
+        {
+            return;
+        }
+
+        _dialogInProgress = true;
+        UpdateUiState();
+        try
+        {
+            var previousDefault = _settings.DefaultDownloadDirectory;
+            var dialog = new SettingsWindow(
+                previousDefault,
+                directory => _settingsStore.SaveAsync(new AppSettings
+                {
+                    DefaultDownloadDirectory = directory
+                }))
+            {
+                Owner = this
+            };
+            if (dialog.ShowDialog() != true)
+            {
+                return;
+            }
+
+            var updatedSettings = new AppSettings
+            {
+                DefaultDownloadDirectory = dialog.SelectedDirectory
+            };
+            _settings = updatedSettings;
+
+            if (string.IsNullOrWhiteSpace(FolderBox.Text)
+                || PathsEqual(FolderBox.Text, previousDefault))
+            {
+                FolderBox.Text = updatedSettings.DefaultDownloadDirectory;
+            }
+
+            DiagnosticLog.Info("UI", "Default download directory updated");
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            DiagnosticLog.Error("Settings", "Unable to save settings from the UI", exception);
+            MessageBox.Show(this, exception.Message, "无法保存设置", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            _dialogInProgress = false;
+            UpdateUiState();
+        }
+    }
+
+    private void AboutButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dialogInProgress || _mergeInProgress)
+        {
+            return;
+        }
+
+        _dialogInProgress = true;
+        UpdateUiState();
+        try
+        {
+            var dialog = new AboutWindow { Owner = this };
+            dialog.ShowDialog();
+        }
+        finally
+        {
+            _dialogInProgress = false;
+            UpdateUiState();
+        }
+    }
+
     private async void RemoveButton_Click(object sender, RoutedEventArgs e)
     {
         if (SelectedJob() is not { } job)
@@ -672,6 +801,26 @@ public partial class MainWindow : Window
         DiagnosticLog.Info("UI", $"Shutdown requested; activeJobs={Jobs.Count(item => item.ActiveTask is { IsCompleted: false })}");
         _saveTimer.Stop();
         IsEnabled = false;
+        if (!_isInitialized && _initializationTask is not null)
+        {
+            try
+            {
+                await _initializationTask;
+            }
+            catch
+            {
+                // Initialization failure has already been logged by Window_Loaded.
+            }
+        }
+
+        if (!_isInitialized)
+        {
+            DiagnosticLog.Warning("UI", "Shutdown skipped queue save because initialization did not complete");
+            _allowClose = true;
+            Close();
+            return;
+        }
+
         var activeTasks = Jobs
             .Where(item => item.ActiveTask is { IsCompleted: false })
             .Select(item => item.ActiveTask!)
@@ -713,27 +862,41 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!_queueDirty || _saveInProgress)
-        {
-            return;
-        }
-
-        var snapshot = Jobs.ToList();
-        _queueDirty = false;
-        _saveInProgress = true;
+        await _queueSaveGate.WaitAsync();
         try
         {
-            await _store.SaveAsync(snapshot);
-        }
-        catch (IOException exception)
-        {
-            _queueDirty = true;
-            DiagnosticLog.Error("Queue", "Unable to save task queue", exception);
-            StorageText.Text = $"任务列表保存失败：{exception.Message}";
+            if (_mergeInProgress)
+            {
+                _queueDirty = true;
+                return;
+            }
+
+            if (!_queueDirty)
+            {
+                return;
+            }
+
+            var snapshot = Jobs.ToList();
+            _queueDirty = false;
+            _saveInProgress = true;
+            try
+            {
+                await _store.SaveAsync(snapshot);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                _queueDirty = true;
+                DiagnosticLog.Error("Queue", "Unable to save task queue", exception);
+                StorageText.Text = $"任务列表保存失败：{exception.Message}";
+            }
+            finally
+            {
+                _saveInProgress = false;
+            }
         }
         finally
         {
-            _saveInProgress = false;
+            _queueSaveGate.Release();
         }
     }
 
@@ -778,19 +941,36 @@ public partial class MainWindow : Window
     {
         var selectedJobs = SelectedJobs();
         var selected = selectedJobs.Count == 1 ? selectedJobs[0] : null;
-        AddButton.IsEnabled = !_mergeInProgress;
-        QueueGrid.IsEnabled = !_mergeInProgress;
-        PauseButton.IsEnabled = !_mergeInProgress
+        var canInteract = _isInitialized && !_isClosing && !_mergeInProgress && !_dialogInProgress;
+        UrlBox.IsEnabled = canInteract;
+        FolderBox.IsEnabled = canInteract;
+        BrowseButton.IsEnabled = canInteract;
+        SegmentBox.IsEnabled = canInteract;
+        AddButton.IsEnabled = canInteract;
+        QueueGrid.IsEnabled = canInteract;
+        PauseButton.IsEnabled = canInteract
             && selected?.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging;
-        ResumeButton.IsEnabled = !_mergeInProgress && selected?.State is DownloadState.Pending or DownloadState.Paused;
-        RetryButton.IsEnabled = !_mergeInProgress && selected?.State == DownloadState.Failed;
-        UpdateLinkButton.IsEnabled = !_mergeInProgress
+        ResumeButton.IsEnabled = canInteract && selected?.State is DownloadState.Pending or DownloadState.Paused;
+        RetryButton.IsEnabled = canInteract && selected?.State == DownloadState.Failed;
+        UpdateLinkButton.IsEnabled = canInteract
             && selected?.State is DownloadState.Pending or DownloadState.Paused or DownloadState.Failed;
-        MergeButton.IsEnabled = !_mergeInProgress && selectedJobs.Count == 2;
-        OpenButton.IsEnabled = !_mergeInProgress && selected is not null;
-        RemoveButton.IsEnabled = !_mergeInProgress && selected is not null;
-        ClearCompletedButton.IsEnabled = !_mergeInProgress && Jobs.Any(job => job.State == DownloadState.Completed);
-        EmptyState.Visibility = Jobs.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        MergeButton.IsEnabled = canInteract && selectedJobs.Count == 2;
+        OpenButton.IsEnabled = canInteract && selected is not null;
+        RemoveButton.IsEnabled = canInteract && selected is not null;
+        ClearCompletedButton.IsEnabled = canInteract && Jobs.Any(job => job.State == DownloadState.Completed);
+        LogButton.IsEnabled = !_isClosing && !_dialogInProgress;
+        SettingsButton.IsEnabled = canInteract;
+        AboutButton.IsEnabled = canInteract;
+        EmptyState.Visibility = _isInitialized && Jobs.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        if (!_isInitialized)
+        {
+            SummaryText.Text = _initializationTask?.IsFaulted == true
+                ? "任务列表加载失败，请查看诊断日志"
+                : "正在加载任务列表...";
+            StorageText.Text = string.Empty;
+            return;
+        }
 
         var active = Jobs.Count(job => job.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging);
         var completed = Jobs.Count(job => job.State == DownloadState.Completed);
@@ -809,6 +989,21 @@ public partial class MainWindow : Window
         catch
         {
             StorageText.Text = string.Empty;
+        }
+    }
+
+    private static bool PathsEqual(string first, string second)
+    {
+        try
+        {
+            return string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(first)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(second)),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            return string.Equals(first.Trim(), second.Trim(), StringComparison.OrdinalIgnoreCase);
         }
     }
 

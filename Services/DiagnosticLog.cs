@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -35,10 +34,9 @@ internal static class DiagnosticLog
 
     public static void Initialize()
     {
-        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "unknown";
         Info(
             "App",
-            $"Session started; session={SessionId}; version={version}; " +
+            $"Session started; session={SessionId}; version={AppInfo.Version}; " +
             $"os={RuntimeInformation.OSDescription}; framework={RuntimeInformation.FrameworkDescription}; " +
             $"architecture={RuntimeInformation.ProcessArchitecture}");
     }

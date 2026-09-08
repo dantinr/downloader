@@ -24,7 +24,7 @@ public partial class App : Application
         DiagnosticLog.Error("App", "Unhandled UI exception", e.Exception);
         MessageBox.Show(
             e.Exception.Message,
-            "downloader",
+            AppInfo.WindowTitle,
             MessageBoxButton.OK,
             MessageBoxImage.Error);
         e.Handled = true;

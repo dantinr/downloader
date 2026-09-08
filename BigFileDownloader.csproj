@@ -11,6 +11,8 @@
     <RootNamespace>BigFileDownloader</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Version>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/VERSION').Trim())</Version>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Authors>downloader</Authors>
     <Description>支持分块并发和断点续传的 Windows 大文件下载器</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
