@@ -6,7 +6,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**;tests\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**;tests\**;Release\**</DefaultItemExcludes>
     <AssemblyName>downloader</AssemblyName>
     <RootNamespace>BigFileDownloader</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -18,6 +18,8 @@
     <RepositoryType>git</RepositoryType>
     <PublishSingleFile>true</PublishSingleFile>
     <DebugType>embedded</DebugType>
+    <VersionedReleaseDirectory>$(MSBuildProjectDirectory)\Release\</VersionedReleaseDirectory>
+    <VersionedReleaseExecutable>$(VersionedReleaseDirectory)$(AssemblyName)-$(Version).exe</VersionedReleaseExecutable>
   </PropertyGroup>
 
   <Target Name="ValidateProjectVersion" BeforeTargets="PrepareForBuild">
@@ -29,5 +31,20 @@
     <None Update="LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Update="VERSION" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <Target Name="CreateVersionedReleaseArtifact"
+          AfterTargets="Publish"
+          Condition="'$(Configuration)' == 'Release' and '$(RuntimeIdentifier)' == 'win-x64'">
+    <Error Condition="!Exists('$(PublishDir)$(AssemblyName).exe')"
+           Text="找不到发布后的单文件程序：$(PublishDir)$(AssemblyName).exe" />
+    <MakeDir Directories="$(VersionedReleaseDirectory)" />
+    <Copy SourceFiles="$(PublishDir)$(AssemblyName).exe"
+          DestinationFiles="$(VersionedReleaseExecutable)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\LICENSE;$(MSBuildProjectDirectory)\VERSION"
+          DestinationFolder="$(VersionedReleaseDirectory)"
+          SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="发布文件：$(VersionedReleaseExecutable)" />
+  </Target>
 
 </Project>

@@ -16,12 +16,14 @@ public partial class MainWindow : Window
 {
     private readonly DownloadEngine _engine = new();
     private readonly DownloadQueueStore _store = new();
+    private readonly PartialDownloadMergeService _mergeService = new();
     private readonly DispatcherTimer _saveTimer;
     private bool _queueDirty;
     private bool _isLoaded;
     private bool _isClosing;
     private bool _allowClose;
     private bool _saveInProgress;
+    private bool _mergeInProgress;
 
     public ObservableCollection<DownloadJob> Jobs { get; } = [];
 
@@ -70,6 +72,11 @@ public partial class MainWindow : Window
 
     private async Task AddDownloadAsync()
     {
+        if (_mergeInProgress)
+        {
+            return;
+        }
+
         var url = UrlBox.Text.Trim();
         var destination = FolderBox.Text.Trim();
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
@@ -257,6 +264,248 @@ public partial class MainWindow : Window
         await StartJobAsync(job);
     }
 
+    private async void MergeButton_Click(object sender, RoutedEventArgs e)
+    {
+        var selected = SelectedJobs();
+        if (selected.Count != 2)
+        {
+            MessageBox.Show("请选择两个需要整合的重复任务。", "无法整合", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        DownloadJob target;
+        DownloadJob redundant;
+        long targetBytes;
+        long redundantBytes;
+        try
+        {
+            var candidates = selected
+                .Select(job => (Job: job, Bytes: _mergeService.GetRecoverableBytes(job)))
+                .OrderByDescending(item => item.Bytes)
+                .ThenBy(item => item.Job.CreatedAt)
+                .ToArray();
+            (target, targetBytes) = candidates[0];
+            (redundant, redundantBytes) = candidates[1];
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or IOException)
+        {
+            MessageBox.Show(exception.Message, "无法整合", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var previouslyActive = selected
+            .Where(job => job.ActiveTask is { IsCompleted: false })
+            .OrderByDescending(job => job.CreatedAt)
+            .ToList();
+        var shouldResume = previouslyActive.Count > 0;
+        var linkSource = previouslyActive.FirstOrDefault()
+            ?? selected.OrderByDescending(job => job.CreatedAt).First();
+        var sourceHost = Uri.TryCreate(linkSource.Url, UriKind.Absolute, out var sourceUri)
+            ? sourceUri.Host
+            : "未知服务器";
+        var targetPath = target.ResolvedTargetPath ?? target.TargetDisplay;
+        var redundantPath = redundant.ResolvedTargetPath ?? redundant.TargetDisplay;
+        var redundantPartsPath = redundantPath + ".bfdl.parts";
+        var afterDescription = shouldResume
+            ? "整合成功后会自动继续下载。"
+            : "两个任务当前都未下载，整合成功后将保持暂停。";
+        var unverifiableBytes = Math.Max(0, targetBytes - redundantBytes);
+        var confirmation =
+            $"保留任务：\n{targetPath}\n" +
+            $"已下载：{DownloadJob.FormatBytes(targetBytes)}\n\n" +
+            $"移除重复记录：\n{redundantPath}\n" +
+            $"已下载：{DownloadJob.FormatBytes(redundantBytes)}\n\n" +
+            $"链接来源：{sourceHost}\n" +
+            $"{afterDescription}\n\n" +
+            $"可逐字节交叉验证：{DownloadJob.FormatBytes(redundantBytes)}\n" +
+            $"无法与新链接完整校验：{DownloadJob.FormatBytes(unverifiableBytes)}\n" +
+            "没有发布方提供的整文件 Hash 时，软件无法证明未重叠区域；请确认两个任务确实是同一版本文件。\n\n" +
+            $"为保护数据，整合后不会自动删除磁盘上的临时分块：\n{redundantPartsPath}\n" +
+            "确认下载完成后可手动清理。";
+        if (MessageBox.Show(
+                confirmation + "\n\n继续整合？",
+                "整合重复任务",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning,
+                MessageBoxResult.Cancel) != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        var originalStatuses = selected.ToDictionary(
+            job => job.Id,
+            job => (State: job.State, Message: job.Message));
+        var originalTargetUrl = target.Url;
+        var originalTargetEtag = target.ETag;
+        var originalTargetLastModified = target.LastModified;
+        var originalTargetSupportsRanges = target.SupportsRanges;
+        var redundantIndex = Jobs.IndexOf(redundant);
+        var redundantDetached = false;
+        var consolidated = false;
+        _mergeInProgress = true;
+        _saveTimer.Stop();
+        UpdateUiState();
+        var activeTasks = selected
+            .Where(job => job.ActiveTask is { IsCompleted: false })
+            .Select(job => job.ActiveTask!)
+            .ToArray();
+
+        try
+        {
+            while (_saveInProgress)
+            {
+                await Task.Delay(25);
+            }
+
+            foreach (var job in selected.Where(job => job.ActiveTask is { IsCompleted: false }))
+            {
+                job.State = DownloadState.Pausing;
+                job.Message = "正在暂停以整合任务";
+                job.Cancellation?.Cancel();
+            }
+
+            await Task.WhenAll(activeTasks);
+            target.State = DownloadState.Merging;
+            target.Message = "正在验证重复任务的已下载内容";
+            redundant.State = DownloadState.Merging;
+            redundant.Message = "正在验证重复任务的已下载内容";
+
+            var result = await _mergeService.ValidateRedundantTaskAsync(target, redundant);
+            target.Message = "正在验证继续下载所用的链接";
+            DownloadProbe probe;
+            using (var probeCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
+            {
+                try
+                {
+                    probe = await _engine.ProbeAsync(linkSource.Url, probeCancellation.Token);
+                }
+                catch (OperationCanceledException) when (probeCancellation.IsCancellationRequested)
+                {
+                    throw new TimeoutException("验证下载链接超过 30 秒，已停止整合；两个任务和分块均已保留。");
+                }
+            }
+
+            if (probe.TotalBytes != target.TotalBytes)
+            {
+                throw new InvalidOperationException("新链接报告的文件大小与已有分块不一致，已停止整合。");
+            }
+
+            if (!probe.SupportsRanges)
+            {
+                throw new InvalidOperationException("新链接不支持断点续传，不能用于保留现有分块。");
+            }
+
+            if (DownloadEngine.RemoteFileChanged(
+                    linkSource.TotalBytes,
+                    linkSource.ETag,
+                    linkSource.LastModified,
+                    probe))
+            {
+                throw new InvalidOperationException(
+                    "下载链接的 ETag 或修改时间已变化，无法确认它仍是创建该任务时的文件；两个任务均已保留。");
+            }
+
+            target.Url = linkSource.Url;
+            target.ETag = probe.ETag;
+            target.LastModified = probe.LastModified;
+            target.SupportsRanges = probe.SupportsRanges;
+            target.DownloadedBytes = result.RecoveredBytes;
+            target.State = DownloadState.Paused;
+            target.Message = shouldResume
+                ? $"已整合，保留 {DownloadJob.FormatBytes(result.RecoveredBytes)}，正在继续"
+                : $"已整合，保留 {DownloadJob.FormatBytes(result.RecoveredBytes)}；旧临时数据需手动清理";
+
+            DetachJob(redundant);
+            Jobs.Remove(redundant);
+            redundantDetached = true;
+            try
+            {
+                await _store.SaveAsync(Jobs.ToList());
+                _queueDirty = true;
+                consolidated = true;
+            }
+            catch (Exception exception)
+            {
+                AttachJob(redundant);
+                Jobs.Insert(Math.Clamp(redundantIndex, 0, Jobs.Count), redundant);
+                redundantDetached = false;
+                MarkDirty();
+                throw new IOException("整合结果无法保存，两个任务记录均已保留。", exception);
+            }
+
+            DiagnosticLog.Info(
+                "UI",
+                $"Duplicate tasks consolidated; target={target.Id:N}; redundant={redundant.Id:N}; " +
+                $"linkSource={linkSource.Id:N}; recoveredBytes={result.RecoveredBytes}; " +
+                $"comparedBytes={result.ComparedBytes}; redundantPartsDeleted=false");
+            QueueGrid.SelectedItem = target;
+        }
+        catch (Exception exception)
+        {
+            if (!consolidated)
+            {
+                if (redundantDetached && !Jobs.Contains(redundant))
+                {
+                    AttachJob(redundant);
+                    Jobs.Insert(Math.Clamp(redundantIndex, 0, Jobs.Count), redundant);
+                    redundantDetached = false;
+                }
+
+                target.Url = originalTargetUrl;
+                target.ETag = originalTargetEtag;
+                target.LastModified = originalTargetLastModified;
+                target.SupportsRanges = originalTargetSupportsRanges;
+                foreach (var job in selected.Where(Jobs.Contains))
+                {
+                    var original = originalStatuses[job.Id];
+                    if (previouslyActive.Contains(job))
+                    {
+                        job.State = DownloadState.Paused;
+                        job.Message = "整合未完成，正在恢复下载";
+                    }
+                    else
+                    {
+                        job.State = original.State;
+                        job.Message = original.Message;
+                    }
+                }
+
+                DiagnosticLog.Error("Merge", "Unable to consolidate selected tasks", exception);
+                MessageBox.Show(exception.Message, "任务整合失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            else
+            {
+                DiagnosticLog.Error("Merge", "Task records were consolidated but final UI update failed", exception);
+                MessageBox.Show(
+                    "任务记录已经整合并保存，但界面状态更新失败。重新打开软件即可恢复。",
+                    "整合已保存",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+        finally
+        {
+            _mergeInProgress = false;
+            MarkDirty();
+            UpdateUiState();
+        }
+
+        if (consolidated)
+        {
+            if (shouldResume)
+            {
+                _ = StartJobAsync(target);
+            }
+        }
+        else
+        {
+            foreach (var job in previouslyActive.Where(job => Jobs.Contains(job) && job.State != DownloadState.Completed))
+            {
+                _ = StartJobAsync(job);
+            }
+        }
+    }
+
     private void BrowseButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFolderDialog
@@ -369,9 +618,10 @@ public partial class MainWindow : Window
 
     private void QueueGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (SelectedJob() is { } job)
+        var selected = SelectedJobs();
+        if (selected.Count == 1)
         {
-            OpenJobLocation(job);
+            OpenJobLocation(selected[0]);
         }
     }
 
@@ -398,6 +648,13 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (_mergeInProgress)
+        {
+            e.Cancel = true;
+            MessageBox.Show("任务正在合并，请等待操作完成后再关闭。", "正在合并", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
         if (_allowClose)
         {
             _saveTimer.Stop();
@@ -450,6 +707,12 @@ public partial class MainWindow : Window
 
     private async Task SaveQueueAsync()
     {
+        if (_mergeInProgress)
+        {
+            _queueDirty = true;
+            return;
+        }
+
         if (!_queueDirty || _saveInProgress)
         {
             return;
@@ -493,13 +756,15 @@ public partial class MainWindow : Window
     private void MarkDirty()
     {
         _queueDirty = true;
-        if (!_saveTimer.IsEnabled)
+        if (!_mergeInProgress && !_saveTimer.IsEnabled)
         {
             _saveTimer.Start();
         }
     }
 
     private DownloadJob? SelectedJob() => QueueGrid.SelectedItem as DownloadJob;
+
+    private IReadOnlyList<DownloadJob> SelectedJobs() => QueueGrid.SelectedItems.OfType<DownloadJob>().ToList();
 
     private int SelectedSegmentCount()
     {
@@ -511,14 +776,20 @@ public partial class MainWindow : Window
 
     private void UpdateUiState()
     {
-        var selected = SelectedJob();
-        PauseButton.IsEnabled = selected?.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging;
-        ResumeButton.IsEnabled = selected?.State is DownloadState.Pending or DownloadState.Paused;
-        RetryButton.IsEnabled = selected?.State == DownloadState.Failed;
-        UpdateLinkButton.IsEnabled = selected?.State is DownloadState.Pending or DownloadState.Paused or DownloadState.Failed;
-        OpenButton.IsEnabled = selected is not null;
-        RemoveButton.IsEnabled = selected is not null;
-        ClearCompletedButton.IsEnabled = Jobs.Any(job => job.State == DownloadState.Completed);
+        var selectedJobs = SelectedJobs();
+        var selected = selectedJobs.Count == 1 ? selectedJobs[0] : null;
+        AddButton.IsEnabled = !_mergeInProgress;
+        QueueGrid.IsEnabled = !_mergeInProgress;
+        PauseButton.IsEnabled = !_mergeInProgress
+            && selected?.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging;
+        ResumeButton.IsEnabled = !_mergeInProgress && selected?.State is DownloadState.Pending or DownloadState.Paused;
+        RetryButton.IsEnabled = !_mergeInProgress && selected?.State == DownloadState.Failed;
+        UpdateLinkButton.IsEnabled = !_mergeInProgress
+            && selected?.State is DownloadState.Pending or DownloadState.Paused or DownloadState.Failed;
+        MergeButton.IsEnabled = !_mergeInProgress && selectedJobs.Count == 2;
+        OpenButton.IsEnabled = !_mergeInProgress && selected is not null;
+        RemoveButton.IsEnabled = !_mergeInProgress && selected is not null;
+        ClearCompletedButton.IsEnabled = !_mergeInProgress && Jobs.Any(job => job.State == DownloadState.Completed);
         EmptyState.Visibility = Jobs.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
         var active = Jobs.Count(job => job.State is DownloadState.Inspecting or DownloadState.Downloading or DownloadState.Merging);

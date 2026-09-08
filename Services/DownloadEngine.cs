@@ -559,12 +559,19 @@ internal sealed class DownloadEngine : IDisposable
         }
     }
 
-    private static bool RemoteFileChanged(
+    internal static bool RemoteFileChanged(
         long? previousTotalBytes,
         string? previousEtag,
         DateTimeOffset? previousLastModified,
         DownloadProbe probe)
     {
+        if (previousTotalBytes is not null
+            && probe.TotalBytes is not null
+            && previousTotalBytes.Value != probe.TotalBytes.Value)
+        {
+            return true;
+        }
+
         if (!string.IsNullOrWhiteSpace(previousEtag)
             && !string.IsNullOrWhiteSpace(probe.ETag))
         {
@@ -578,9 +585,7 @@ internal sealed class DownloadEngine : IDisposable
             return true;
         }
 
-        return previousTotalBytes is not null
-            && probe.TotalBytes is not null
-            && previousTotalBytes.Value != probe.TotalBytes.Value;
+        return false;
     }
 
     private static bool HasPartialData(DownloadJob job)
