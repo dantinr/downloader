@@ -17,6 +17,8 @@ public sealed class DownloadJob : INotifyPropertyChanged
     private bool _supportsRanges;
     private string? _etag;
     private DateTimeOffset? _lastModified;
+    private TargetFileOwnership _targetFileOwnership;
+    private TargetFileFingerprint? _targetFileFingerprint;
     private DownloadState _state = DownloadState.Pending;
     private string _message = "等待开始";
 
@@ -121,6 +123,18 @@ public sealed class DownloadJob : INotifyPropertyChanged
         set => SetField(ref _lastModified, value);
     }
 
+    public TargetFileOwnership TargetFileOwnership
+    {
+        get => _targetFileOwnership;
+        set => SetField(ref _targetFileOwnership, value);
+    }
+
+    public TargetFileFingerprint? TargetFileFingerprint
+    {
+        get => _targetFileFingerprint;
+        set => SetField(ref _targetFileFingerprint, value);
+    }
+
     public DownloadState State
     {
         get => _state;
@@ -200,6 +214,8 @@ public sealed class DownloadJob : INotifyPropertyChanged
         DownloadState.Pausing => "正在暂停",
         DownloadState.Paused => "已暂停",
         DownloadState.Merging => "正在合并",
+        DownloadState.Deleting => "正在删除",
+        DownloadState.DeletionFailed => "删除未完成",
         DownloadState.Completed => "已完成",
         DownloadState.Failed => "失败",
         _ => State.ToString()

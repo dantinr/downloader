@@ -15,6 +15,19 @@ namespace BigFileDownloader;
 
 public partial class MainWindow : Window
 {
+    private enum RemovalMode
+    {
+        RecordOnly,
+        RecordAndFiles
+    }
+
+    private sealed record JobPathSnapshot(
+        DownloadJob Job,
+        string FileName,
+        string DestinationFolder,
+        string? ResolvedTargetPath,
+        bool IsActive);
+
     private readonly DownloadEngine _engine = new();
     private readonly DownloadQueueStore _store = new();
     private readonly PartialDownloadMergeService _mergeService = new();
@@ -31,6 +44,9 @@ public partial class MainWindow : Window
     private bool _saveInProgress;
     private bool _mergeInProgress;
     private bool _dialogInProgress;
+    private bool _removeInProgress;
+    private IReadOnlyList<DownloadJob> _contextMenuJobs = [];
+    private DownloadJob? _contextMenuAnchorJob;
 
     public ObservableCollection<DownloadJob> Jobs { get; } = [];
 
@@ -147,9 +163,12 @@ public partial class MainWindow : Window
 
         try
         {
+            destination = Path.GetFullPath(destination);
             Directory.CreateDirectory(destination);
+            FolderBox.Text = destination;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
         {
             MessageBox.Show(exception.Message, "无法使用保存位置", MessageBoxButton.OK, MessageBoxImage.Error);
             return;
@@ -678,40 +697,689 @@ public partial class MainWindow : Window
             return;
         }
 
-        var result = MessageBox.Show(
-            "移除任务时是否同时删除未完成的临时分块？\n\n是：删除任务和临时分块\n否：仅从列表移除",
-            "移除下载任务",
-            MessageBoxButton.YesNoCancel,
-            MessageBoxImage.Question);
-        if (result == MessageBoxResult.Cancel)
+        await RemoveJobsAsync([job], RemovalMode.RecordOnly);
+    }
+
+    private void QueueGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.OriginalSource is not DependencyObject source
+            || ItemsControl.ContainerFromElement(QueueGrid, source) is not DataGridRow row)
         {
             return;
         }
 
-        job.Cancellation?.Cancel();
-        if (job.ActiveTask is not null)
+        SelectContextRow(QueueGrid, row);
+    }
+
+    private void TaskContextMenu_Opened(object sender, RoutedEventArgs e)
+    {
+        _contextMenuJobs = [];
+        _contextMenuAnchorJob = null;
+        if (sender is not ContextMenu contextMenu)
         {
-            await job.ActiveTask;
+            return;
         }
 
-        if (result == MessageBoxResult.Yes)
+        var row = contextMenu.PlacementTarget as DataGridRow
+            ?? (contextMenu.PlacementTarget is DependencyObject placementTarget
+                ? ItemsControl.ContainerFromElement(QueueGrid, placementTarget) as DataGridRow
+                : null);
+        if (row is null
+            || row.Item is not DownloadJob job
+            || !Jobs.Contains(job))
         {
-            try
-            {
-                _engine.DeletePartialData(job);
-            }
-            catch (IOException exception)
-            {
-                MessageBox.Show(exception.Message, "临时文件未完全删除", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
+            contextMenu.IsOpen = false;
+            return;
         }
 
-        DetachJob(job);
-        Jobs.Remove(job);
-        DiagnosticLog.Info("UI", $"Task removed; job={job.Id:N}; partialDataDeleted={result == MessageBoxResult.Yes}");
+        SelectContextRow(QueueGrid, row);
+
+        _contextMenuJobs = SelectedJobs()
+            .Where(Jobs.Contains)
+            .DistinctBy(item => item.Id)
+            .ToArray();
+        _contextMenuAnchorJob = job;
+        var canInteract = _isInitialized && !_isClosing && !_mergeInProgress && !_dialogInProgress;
+        var menuItems = contextMenu.Items.OfType<MenuItem>().ToArray();
+        if (menuItems.Length >= 2)
+        {
+            menuItems[0].IsEnabled = canInteract;
+            menuItems[1].IsEnabled = canInteract && _contextMenuJobs.Count > 0;
+        }
+    }
+
+    internal static void SelectContextRow(DataGrid queueGrid, DataGridRow row)
+    {
+        if (!row.IsSelected)
+        {
+            queueGrid.SelectedItems.Clear();
+            row.IsSelected = true;
+        }
+
+        row.Focus();
+    }
+
+    private void OpenLocationMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (_contextMenuAnchorJob is { } job && Jobs.Contains(job))
+        {
+            OpenJobLocation(job);
+        }
+    }
+
+    private async void DeleteRecordMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        var jobs = _contextMenuJobs.ToArray();
+        await RemoveJobsAsync(jobs, RemovalMode.RecordOnly);
+    }
+
+    private async void DeleteFilesMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        var jobs = _contextMenuJobs.ToArray();
+        await RemoveJobsAsync(jobs, RemovalMode.RecordAndFiles);
+    }
+
+    private async Task RemoveJobsAsync(IReadOnlyList<DownloadJob> requestedJobs, RemovalMode mode)
+    {
+        if (!_isInitialized || _isClosing || _mergeInProgress || _dialogInProgress || _removeInProgress)
+        {
+            return;
+        }
+
+        var jobs = requestedJobs
+            .Where(Jobs.Contains)
+            .DistinctBy(job => job.Id)
+            .ToList();
+        if (jobs.Count == 0)
+        {
+            return;
+        }
+
+        _removeInProgress = true;
+        _dialogInProgress = true;
+        UpdateUiState();
+        try
+        {
+            IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> initialPlans =
+                new Dictionary<DownloadJob, DownloadArtifactPlan?>();
+            if (mode == RemovalMode.RecordAndFiles)
+            {
+                var builtPlans = await TryBuildDeletionPlansAsync(jobs);
+                if (builtPlans is null)
+                {
+                    return;
+                }
+
+                initialPlans = builtPlans;
+            }
+
+            if (MessageBox.Show(
+                    this,
+                    BuildRemovalConfirmation(jobs, mode, initialPlans, pathsChanged: false),
+                    mode == RemovalMode.RecordOnly ? "仅删除任务记录" : "删除任务记录及文件",
+                    MessageBoxButton.OKCancel,
+                    mode == RemovalMode.RecordOnly ? MessageBoxImage.Question : MessageBoxImage.Warning,
+                    MessageBoxResult.Cancel) != MessageBoxResult.OK)
+            {
+                return;
+            }
+
+            if (!await StopJobsForRemovalAsync(jobs))
+            {
+                return;
+            }
+
+            var finalPlans = initialPlans;
+            if (mode == RemovalMode.RecordAndFiles)
+            {
+                var builtPlans = await TryBuildDeletionPlansAsync(jobs);
+                if (builtPlans is null)
+                {
+                    return;
+                }
+
+                finalPlans = builtPlans;
+
+                if (DeletionPlansChanged(jobs, initialPlans, finalPlans)
+                    && MessageBox.Show(
+                        this,
+                        BuildRemovalConfirmation(jobs, mode, finalPlans, pathsChanged: true),
+                        "文件路径已更新，请再次确认",
+                        MessageBoxButton.OKCancel,
+                        MessageBoxImage.Warning,
+                        MessageBoxResult.Cancel) != MessageBoxResult.OK)
+                {
+                    return;
+                }
+            }
+
+            var deletionSnapshots = new Dictionary<DownloadJob, (DownloadState State, string Message, long DownloadedBytes)>();
+            if (mode == RemovalMode.RecordAndFiles)
+            {
+                deletionSnapshots = jobs.ToDictionary(
+                    job => job,
+                    job => (job.State, job.Message, job.DownloadedBytes));
+                foreach (var job in jobs)
+                {
+                    job.State = DownloadState.Deleting;
+                    job.Message = "正在准备删除任务文件";
+                    job.BytesPerSecond = 0;
+                }
+
+                MarkDirty();
+                UpdateUiState();
+                if (!await SaveQueueAsync())
+                {
+                    RestoreJobStates(deletionSnapshots);
+                    DiagnosticLog.Warning("UI", "File deletion aborted because the deletion checkpoint could not be saved");
+                    MessageBox.Show(
+                        this,
+                        "任务列表无法保存。为保护磁盘文件，删除操作尚未执行。",
+                        "无法开始删除",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
+                    return;
+                }
+
+                var executionPlans = await TryBuildDeletionPlansAsync(jobs);
+                if (executionPlans is null)
+                {
+                    RestoreJobStates(deletionSnapshots);
+                    await SaveQueueAsync();
+                    return;
+                }
+
+                if (DeletionPlansChanged(jobs, finalPlans, executionPlans))
+                {
+                    RestoreJobStates(deletionSnapshots);
+                    await SaveQueueAsync();
+                    DiagnosticLog.Warning("UI", "File deletion aborted because artifact paths changed after checkpoint");
+                    MessageBox.Show(
+                        this,
+                        "写入删除检查点后，任务文件或保存位置发生了变化。为避免误删，本次操作已取消，请重新执行。",
+                        "文件位置已变化",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+
+                finalPlans = executionPlans;
+            }
+
+            var failures = new Dictionary<DownloadJob, string>();
+            var preservedTargetPaths = new List<string>();
+            var successfulJobs = mode == RemovalMode.RecordOnly
+                ? jobs.ToHashSet()
+                : await Task.Run(() => DeleteJobData(finalPlans, failures, preservedTargetPaths));
+            MarkFailedDeletionJobs(failures.Keys);
+            if (successfulJobs.Count == 0)
+            {
+                MarkDirty();
+                UpdateUiState();
+                await SaveQueueAsync();
+                ShowDeletionFailures(failures, removedCount: 0);
+                return;
+            }
+
+            var removedJobs = successfulJobs
+                .Select(job => (Job: job, Index: Jobs.IndexOf(job)))
+                .Where(item => item.Index >= 0)
+                .OrderBy(item => item.Index)
+                .ToArray();
+            foreach (var (job, _) in removedJobs)
+            {
+                DetachJob(job);
+                Jobs.Remove(job);
+            }
+
+            MarkDirty();
+            UpdateUiState();
+            if (!await SaveQueueAsync())
+            {
+                if (mode == RemovalMode.RecordAndFiles)
+                {
+                    foreach (var (job, _) in removedJobs)
+                    {
+                        if (finalPlans.TryGetValue(job, out var plan) && plan is not null)
+                        {
+                            MarkFailedDeletionJobs([job]);
+                        }
+                        else if (deletionSnapshots.TryGetValue(job, out var snapshot))
+                        {
+                            RestoreJobState(job, snapshot);
+                        }
+                    }
+                }
+
+                RestoreRemovedJobs(removedJobs);
+                DiagnosticLog.Warning(
+                    "UI",
+                    $"Task removal rolled back after queue save failure; count={removedJobs.Length}; filesDeleted={mode == RemovalMode.RecordAndFiles}");
+                MessageBox.Show(
+                    this,
+                    mode == RemovalMode.RecordOnly
+                        ? "任务列表保存失败，删除记录操作已撤销。"
+                        : "任务列表保存失败，任务记录已恢复。已处理的磁盘文件可能已移入回收站或删除，请查看任务状态和诊断日志。",
+                    "无法保存任务列表",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                return;
+            }
+
+            DiagnosticLog.Info(
+                "UI",
+                $"Tasks removed; count={removedJobs.Length}; filesDeleted={mode == RemovalMode.RecordAndFiles}; failures={failures.Count}");
+            if (failures.Count > 0)
+            {
+                ShowDeletionFailures(failures, removedJobs.Length);
+            }
+
+            if (preservedTargetPaths.Count > 0)
+            {
+                ShowPreservedTargetFiles(preservedTargetPaths);
+            }
+        }
+        finally
+        {
+            _contextMenuJobs = [];
+            _contextMenuAnchorJob = null;
+            _removeInProgress = false;
+            _dialogInProgress = false;
+            UpdateUiState();
+        }
+    }
+
+    private static void MarkFailedDeletionJobs(IEnumerable<DownloadJob> jobs)
+    {
+        foreach (var job in jobs)
+        {
+            job.State = DownloadState.DeletionFailed;
+            job.BytesPerSecond = 0;
+            job.Message = "文件删除未完成，记录已保留；请通过右键菜单重试删除或仅删除记录";
+        }
+    }
+
+    private void RestoreJobStates(
+        IReadOnlyDictionary<DownloadJob, (DownloadState State, string Message, long DownloadedBytes)> snapshots)
+    {
+        foreach (var (job, snapshot) in snapshots)
+        {
+            RestoreJobState(job, snapshot);
+        }
+
         MarkDirty();
         UpdateUiState();
-        await SaveQueueAsync();
+    }
+
+    private static void RestoreJobState(
+        DownloadJob job,
+        (DownloadState State, string Message, long DownloadedBytes) snapshot)
+    {
+        job.State = snapshot.State;
+        job.Message = snapshot.Message;
+        job.DownloadedBytes = snapshot.DownloadedBytes;
+    }
+
+    private async Task<IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?>?> TryBuildDeletionPlansAsync(
+        IReadOnlyList<DownloadJob> selectedJobs)
+    {
+        var snapshots = Jobs
+            .Select(job => new JobPathSnapshot(
+                job,
+                job.FileName,
+                job.DestinationFolder,
+                job.ResolvedTargetPath,
+                job.ActiveTask is { IsCompleted: false }))
+            .ToArray();
+        try
+        {
+            return await Task.Run(() => BuildDeletionPlans(selectedJobs, snapshots));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or IOException or InvalidOperationException or NotSupportedException
+                or UnauthorizedAccessException)
+        {
+            DiagnosticLog.Error("UI", "Task file deletion was blocked by path validation", exception);
+            MessageBox.Show(
+                this,
+                exception.Message + "\n\n未删除任何文件。你仍可选择“仅删除任务记录”。",
+                "无法安全删除文件",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return null;
+        }
+    }
+
+    private static IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> BuildDeletionPlans(
+        IReadOnlyList<DownloadJob> selectedJobs,
+        IReadOnlyList<JobPathSnapshot> snapshots)
+    {
+        var selectedSet = selectedJobs.ToHashSet();
+        var snapshotsByJob = snapshots.ToDictionary(snapshot => snapshot.Job);
+        var selectedPlans = new Dictionary<DownloadJob, DownloadArtifactPlan?>();
+        foreach (var job in selectedJobs)
+        {
+            if (!snapshotsByJob.TryGetValue(job, out var snapshot))
+            {
+                throw new InvalidOperationException("待删除任务已不在任务列表中。");
+            }
+
+            try
+            {
+                selectedPlans[job] = DownloadArtifactPlan.CreateFor(
+                    snapshot.DestinationFolder,
+                    snapshot.FileName,
+                    snapshot.ResolvedTargetPath);
+            }
+            catch (Exception exception) when (
+                exception is ArgumentException or IOException or InvalidOperationException or NotSupportedException
+                    or UnauthorizedAccessException)
+            {
+                throw new InvalidOperationException(
+                    $"任务“{job.FileName}”的路径无法安全验证：{exception.Message}",
+                    exception);
+            }
+        }
+
+        var resolvedSelectedPlans = selectedPlans
+            .Where(item => item.Value is not null)
+            .Select(item => (item.Key, Plan: item.Value!))
+            .ToArray();
+        for (var leftIndex = 0; leftIndex < resolvedSelectedPlans.Length; leftIndex++)
+        {
+            for (var rightIndex = leftIndex + 1; rightIndex < resolvedSelectedPlans.Length; rightIndex++)
+            {
+                var left = resolvedSelectedPlans[leftIndex];
+                var right = resolvedSelectedPlans[rightIndex];
+                if (left.Plan.Overlaps(right.Plan) && !left.Plan.HasSameArtifacts(right.Plan))
+                {
+                    throw new InvalidOperationException(
+                        $"任务“{left.Key.FileName}”和“{right.Key.FileName}”的磁盘数据相互重叠，不能自动删除。");
+                }
+            }
+        }
+
+        foreach (var retained in snapshots.Where(snapshot => !selectedSet.Contains(snapshot.Job)))
+        {
+            if (string.IsNullOrWhiteSpace(retained.ResolvedTargetPath))
+            {
+                if (retained.IsActive)
+                {
+                    var pendingDestination = TryNormalizeDirectory(retained.DestinationFolder)
+                        ?? throw new InvalidOperationException(
+                            $"无法验证正在运行的任务“{retained.FileName}”的保存位置。请先暂停该任务。");
+                    if (resolvedSelectedPlans.Any(
+                        selected => selected.Plan.ConflictsWithPendingDestination(pendingDestination)))
+                    {
+                        throw new InvalidOperationException(
+                            $"任务“{retained.FileName}”正在可能重叠的保存位置中确定文件路径。请等待它开始下载或先暂停，再删除文件。");
+                    }
+                }
+
+                continue;
+            }
+
+            var retainedPlan = TryCreatePotentialPlan(retained.ResolvedTargetPath);
+            if (retainedPlan is null)
+            {
+                throw new InvalidOperationException(
+                    $"无法验证保留任务“{retained.FileName}”的实际文件位置。为避免误删，不能删除磁盘文件。");
+            }
+
+            var shared = resolvedSelectedPlans.FirstOrDefault(selected => selected.Plan.Overlaps(retainedPlan));
+            if (shared.Key is not null)
+            {
+                throw new InvalidOperationException(
+                    $"任务“{shared.Key.FileName}”的磁盘数据还被“{retained.FileName}”引用，不能删除共享文件。");
+            }
+        }
+
+        return selectedPlans;
+    }
+
+    private static DownloadArtifactPlan? TryCreatePotentialPlan(string targetPath)
+    {
+        try
+        {
+            return DownloadArtifactPlan.CreateForTargetPath(targetPath);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or IOException or InvalidOperationException or NotSupportedException
+                or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TryNormalizeDirectory(string directory)
+    {
+        try
+        {
+            return Path.TrimEndingDirectorySeparator(
+                PhysicalPathResolver.ResolveForComparison(Path.GetFullPath(directory)));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static string BuildRemovalConfirmation(
+        IReadOnlyList<DownloadJob> jobs,
+        RemovalMode mode,
+        IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> plans,
+        bool pathsChanged)
+    {
+        var subject = jobs.Count == 1 ? $"“{jobs[0].FileName}”" : $"{jobs.Count} 个任务";
+        var activeText = jobs.Any(job => job.ActiveTask is { IsCompleted: false })
+            ? "下载连接会先安全停止。\n"
+            : string.Empty;
+        if (mode == RemovalMode.RecordOnly)
+        {
+            return
+                $"从任务列表删除{subject}？\n\n" +
+                activeText +
+                "磁盘上的成品文件和断点续传临时数据都会保留。\n" +
+                "删除记录后，程序将无法从任务列表继续这些临时数据。\n\n" +
+                "确认仅删除任务记录？";
+        }
+
+        var targetPaths = plans.Values
+            .OfType<DownloadArtifactPlan>()
+            .Select(plan => plan.TargetPath)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var unresolvedCount = plans.Values.Count(plan => plan is null);
+        var pathText = targetPaths.Length == 0
+            ? "这些任务尚未确定文件路径，确认后只会删除记录。"
+            : "目标路径：\n" + FormatPathList(targetPaths);
+        if (unresolvedCount > 0 && targetPaths.Length > 0)
+        {
+            pathText += $"\n另有 {unresolvedCount} 个任务尚未确定文件路径。";
+        }
+
+        var changedText = pathsChanged
+            ? "停止任务后，实际文件路径发生了变化，请重新核对。\n\n"
+            : string.Empty;
+        return
+            changedText +
+            $"删除{subject}的任务记录及文件？\n\n" +
+            activeText +
+            "成品文件将移入 Windows 回收站；不支持回收站的位置可能直接删除。\n" +
+            "断点续传分块和其他临时数据将永久删除。\n" +
+            "保存文件夹及其中其他文件不会删除。\n" +
+            "只有能核实为本任务创建且之后未被替换的成品才会删除；旧任务、外部文件或身份无法核实的成品会保留。\n\n" +
+            pathText +
+            "\n\n确认执行？";
+    }
+
+    private static string FormatPathList(IReadOnlyList<string> paths)
+    {
+        const int maximumDisplayedPaths = 6;
+        var lines = paths.Take(maximumDisplayedPaths).Select(path => $"• {path}").ToList();
+        if (paths.Count > maximumDisplayedPaths)
+        {
+            lines.Add($"• 另外 {paths.Count - maximumDisplayedPaths} 个路径");
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private async Task<bool> StopJobsForRemovalAsync(IReadOnlyList<DownloadJob> jobs)
+    {
+        var active = jobs
+            .Where(job => job.ActiveTask is { IsCompleted: false })
+            .Select(job => (Job: job, Task: job.ActiveTask!))
+            .ToArray();
+        if (active.Length == 0)
+        {
+            return true;
+        }
+
+        if (active.Any(item => item.Job.Cancellation is null))
+        {
+            MessageBox.Show(
+                this,
+                "有任务仍在运行，但无法安全停止。未删除任务或文件，请稍后重试。",
+                "无法停止任务",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return false;
+        }
+
+        try
+        {
+            foreach (var (job, _) in active)
+            {
+                job.State = DownloadState.Pausing;
+                job.Message = "正在安全停止以执行删除";
+                job.Cancellation!.Cancel();
+            }
+
+            await Task.WhenAll(active.Select(item => item.Task));
+            return true;
+        }
+        catch (Exception exception)
+        {
+            DiagnosticLog.Error("UI", "Unable to stop tasks before removal", exception);
+            MessageBox.Show(
+                this,
+                "任务未能安全停止，因此没有删除任何记录或文件。\n\n" + exception.Message,
+                "无法停止任务",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return false;
+        }
+    }
+
+    private static bool DeletionPlansChanged(
+        IReadOnlyList<DownloadJob> jobs,
+        IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> initialPlans,
+        IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> finalPlans)
+    {
+        return jobs.Any(job =>
+        {
+            initialPlans.TryGetValue(job, out var initial);
+            finalPlans.TryGetValue(job, out var final);
+            return initial is null != (final is null)
+                || initial is not null && final is not null && !initial.HasSameArtifacts(final);
+        });
+    }
+
+    private HashSet<DownloadJob> DeleteJobData(
+        IReadOnlyDictionary<DownloadJob, DownloadArtifactPlan?> plans,
+        IDictionary<DownloadJob, string> failures,
+        ICollection<string> preservedTargetPaths)
+    {
+        var successful = plans
+            .Where(item => item.Value is null)
+            .Select(item => item.Key)
+            .ToHashSet();
+        var planGroups = plans
+            .Where(item => item.Value is not null)
+            .GroupBy(item => item.Value!.ArtifactIdentityKey, StringComparer.Ordinal);
+        foreach (var group in planGroups)
+        {
+            var groupJobs = group.Select(item => item.Key).ToArray();
+            try
+            {
+                var deletionPlan = group.First().Value!;
+                var result = _engine.DeleteDownloadData(groupJobs, deletionPlan);
+                if (result.PreservedTargetPath is not null)
+                {
+                    preservedTargetPaths.Add(result.PreservedTargetPath);
+                }
+
+                successful.UnionWith(groupJobs);
+            }
+            catch (Exception exception)
+            {
+                DiagnosticLog.Error(
+                    "UI",
+                    $"Task files could not be fully deleted; target={group.First().Value!.TargetPath}; " +
+                    $"jobs={string.Join(',', groupJobs.Select(job => job.Id.ToString("N")))}",
+                    exception);
+                foreach (var job in groupJobs)
+                {
+                    failures[job] = exception.Message;
+                }
+            }
+        }
+
+        return successful;
+    }
+
+    private void ShowPreservedTargetFiles(IReadOnlyCollection<string> paths)
+    {
+        var distinctPaths = paths.Distinct(StringComparer.Ordinal).ToArray();
+        MessageBox.Show(
+            this,
+            "以下目标已确认不是由对应下载任务创建，因此未删除。任务记录和任务临时数据已处理。\n\n" +
+            FormatPathList(distinctPaths),
+            "已保留外部文件",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    private void ShowDeletionFailures(IReadOnlyDictionary<DownloadJob, string> failures, int removedCount)
+    {
+        if (failures.Count == 0)
+        {
+            return;
+        }
+
+        var details = failures
+            .Take(5)
+            .Select(item =>
+                $"• {item.Key.FileName}\n  {item.Key.ResolvedTargetPath ?? "尚未确定路径"}\n  {item.Value}")
+            .ToList();
+        if (failures.Count > details.Count)
+        {
+            details.Add($"• 另外 {failures.Count - details.Count} 个任务未处理");
+        }
+
+        var summary = removedCount > 0
+            ? $"已删除 {removedCount} 个任务；另有 {failures.Count} 个任务的文件未能完整处理，记录已保留。"
+            : $"{failures.Count} 个任务的文件未能完整处理，任务记录均已保留。";
+        MessageBox.Show(
+            this,
+            summary + "\n\n" + string.Join("\n\n", details),
+            "部分文件未删除",
+            MessageBoxButton.OK,
+            MessageBoxImage.Warning);
+    }
+
+    private void RestoreRemovedJobs(IEnumerable<(DownloadJob Job, int Index)> removedJobs)
+    {
+        foreach (var (job, index) in removedJobs.OrderBy(item => item.Index))
+        {
+            AttachJob(job);
+            Jobs.Insert(Math.Min(index, Jobs.Count), job);
+        }
+
+        MarkDirty();
+        UpdateUiState();
     }
 
     private async void ClearCompletedButton_Click(object sender, RoutedEventArgs e)
@@ -722,25 +1390,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (MessageBox.Show(
-                $"从列表移除 {completed.Count} 个已完成任务？\n已下载文件不会删除。",
-                "清理已完成任务",
-                MessageBoxButton.OKCancel,
-                MessageBoxImage.Question) != MessageBoxResult.OK)
-        {
-            return;
-        }
-
-        foreach (var job in completed)
-        {
-            DetachJob(job);
-            Jobs.Remove(job);
-        }
-
-        DiagnosticLog.Info("UI", $"Completed tasks cleared; count={completed.Count}");
-        MarkDirty();
-        UpdateUiState();
-        await SaveQueueAsync();
+        await RemoveJobsAsync(completed, RemovalMode.RecordOnly);
     }
 
     private void QueueGrid_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateUiState();
@@ -758,17 +1408,29 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (!string.IsNullOrWhiteSpace(job.ResolvedTargetPath) && File.Exists(job.ResolvedTargetPath))
+            if (!string.IsNullOrWhiteSpace(job.ResolvedTargetPath)
+                && Path.IsPathFullyQualified(job.ResolvedTargetPath)
+                && File.Exists(job.ResolvedTargetPath))
             {
                 Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{job.ResolvedTargetPath}\"") { UseShellExecute = true });
             }
-            else
+            else if (Path.IsPathFullyQualified(job.DestinationFolder) && Directory.Exists(job.DestinationFolder))
             {
-                Directory.CreateDirectory(job.DestinationFolder);
                 Process.Start(new ProcessStartInfo("explorer.exe", $"\"{job.DestinationFolder}\"") { UseShellExecute = true });
             }
+            else
+            {
+                MessageBox.Show(
+                    this,
+                    "任务记录的保存位置不存在或不是绝对路径。",
+                    "无法打开文件位置",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception)
+        catch (Exception exception) when (
+            exception is ArgumentException or IOException or InvalidOperationException or NotSupportedException
+                or UnauthorizedAccessException or Win32Exception)
         {
             DiagnosticLog.Error("UI", $"Unable to open task location; job={job.Id:N}", exception);
             MessageBox.Show(exception.Message, "无法打开文件夹", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -777,6 +1439,13 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (_removeInProgress)
+        {
+            e.Cancel = true;
+            MessageBox.Show("正在安全停止任务或删除文件，请等待操作完成。", "正在处理删除", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
         if (_mergeInProgress)
         {
             e.Cancel = true;
@@ -854,12 +1523,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task SaveQueueAsync()
+    private async Task<bool> SaveQueueAsync()
     {
         if (_mergeInProgress)
         {
             _queueDirty = true;
-            return;
+            return false;
         }
 
         await _queueSaveGate.WaitAsync();
@@ -868,12 +1537,12 @@ public partial class MainWindow : Window
             if (_mergeInProgress)
             {
                 _queueDirty = true;
-                return;
+                return false;
             }
 
             if (!_queueDirty)
             {
-                return;
+                return true;
             }
 
             var snapshot = Jobs.ToList();
@@ -888,11 +1557,14 @@ public partial class MainWindow : Window
                 _queueDirty = true;
                 DiagnosticLog.Error("Queue", "Unable to save task queue", exception);
                 StorageText.Text = $"任务列表保存失败：{exception.Message}";
+                return false;
             }
             finally
             {
                 _saveInProgress = false;
             }
+
+            return true;
         }
         finally
         {

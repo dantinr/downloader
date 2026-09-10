@@ -40,7 +40,12 @@ internal sealed class DownloadQueueStore
                 job.Cancellation = null;
                 job.ActiveTask = null;
                 job.BytesPerSecond = 0;
-                if (job.State is DownloadState.Downloading or DownloadState.Inspecting or DownloadState.Merging or DownloadState.Pausing)
+                if (job.State == DownloadState.Deleting)
+                {
+                    job.State = DownloadState.DeletionFailed;
+                    job.Message = "上次删除未完成，请检查文件位置后重试";
+                }
+                else if (job.State is DownloadState.Downloading or DownloadState.Inspecting or DownloadState.Merging or DownloadState.Pausing)
                 {
                     job.State = DownloadState.Paused;
                     job.Message = "上次退出后已暂停";

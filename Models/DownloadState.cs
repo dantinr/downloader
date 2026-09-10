@@ -9,5 +9,7 @@ public enum DownloadState
     Paused,
     Merging,
     Completed,
-    Failed
+    Failed,
+    Deleting,
+    DeletionFailed
 }

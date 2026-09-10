@@ -66,7 +66,7 @@ internal static class FileNameHelper
     public static string EnsureUniquePath(string directory, string fileName)
     {
         var target = Path.Combine(directory, Sanitize(fileName));
-        if (!File.Exists(target) && !Directory.Exists(target + ".bfdl.parts") && !File.Exists(target + ".bfdl.tmp"))
+        if (IsAvailableTarget(target))
         {
             return target;
         }
@@ -76,7 +76,7 @@ internal static class FileNameHelper
         for (var index = 1; index < 10_000; index++)
         {
             target = Path.Combine(directory, $"{stem} ({index}){extension}");
-            if (!File.Exists(target) && !Directory.Exists(target + ".bfdl.parts") && !File.Exists(target + ".bfdl.tmp"))
+            if (IsAvailableTarget(target))
             {
                 return target;
             }
@@ -84,4 +84,12 @@ internal static class FileNameHelper
 
         throw new IOException("无法为下载文件生成唯一名称。");
     }
+
+    private static bool IsAvailableTarget(string targetPath) =>
+        !PathExists(targetPath)
+        && !PathExists(targetPath + ".bfdl.parts")
+        && !PathExists(targetPath + ".bfdl.tmp")
+        && !PathExists(targetPath + ".assembling");
+
+    private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
 }

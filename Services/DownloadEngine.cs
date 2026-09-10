@@ -4,20 +4,34 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Web;
 using BigFileDownloader.Models;
+using Microsoft.VisualBasic.FileIO;
 
 namespace BigFileDownloader.Services;
 
+internal readonly record struct DownloadDataDeletionResult(
+    bool TargetRecycled,
+    string? PreservedTargetPath);
+
 internal sealed class DownloadEngine : IDisposable
 {
+    private sealed record ValidatedPartialArtifacts(
+        bool PartsDirectoryExists,
+        IReadOnlyList<string> Files);
+
     private const int BufferSize = 256 * 1024;
     private const int MaximumAttempts = 4;
     private readonly HttpClient _client;
     private readonly bool _ownsClient;
     private readonly long _minimumSegmentSize;
+    private readonly Action<string> _recycleTargetFile;
 
-    public DownloadEngine(HttpClient? client = null, long minimumSegmentSize = 8 * 1024 * 1024)
+    public DownloadEngine(
+        HttpClient? client = null,
+        long minimumSegmentSize = 8 * 1024 * 1024,
+        Action<string>? recycleTargetFile = null)
     {
         _minimumSegmentSize = minimumSegmentSize;
+        _recycleTargetFile = recycleTargetFile ?? RecycleTargetFile;
         if (client is not null)
         {
             _client = client;
@@ -131,6 +145,15 @@ internal sealed class DownloadEngine : IDisposable
             && probe.TotalBytes is > 0
             && new FileInfo(job.ResolvedTargetPath).Length == probe.TotalBytes.Value)
         {
+            if (job.TargetFileOwnership != TargetFileOwnership.CreatedByDownloader
+                || !PhysicalPathResolver.MatchesFileFingerprint(
+                    job.ResolvedTargetPath,
+                    job.TargetFileFingerprint))
+            {
+                job.TargetFileOwnership = TargetFileOwnership.ExistingFile;
+                job.TargetFileFingerprint = null;
+            }
+
             job.DownloadedBytes = probe.TotalBytes.Value;
             progress.Report(new DownloadProgress(probe.TotalBytes.Value, probe.TotalBytes, 0));
             DiagnosticLog.Info("Engine", $"Existing target is already complete; job={job.Id:N}");
@@ -139,7 +162,14 @@ internal sealed class DownloadEngine : IDisposable
 
         if (probe.TotalBytes == 0)
         {
-            await File.WriteAllBytesAsync(job.ResolvedTargetPath, [], cancellationToken);
+            var temporaryPath = TemporaryPath(job.ResolvedTargetPath);
+            await File.WriteAllBytesAsync(temporaryPath, [], cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            MoveIntoOwnedTarget(
+                temporaryPath,
+                job.ResolvedTargetPath,
+                job,
+                "目标文件已存在，空文件下载结果保留在临时文件中。");
             progress.Report(new DownloadProgress(0, 0, 0));
             DiagnosticLog.Info("Engine", $"Created empty target; job={job.Id:N}; file={job.ResolvedTargetPath}");
             return;
@@ -161,20 +191,74 @@ internal sealed class DownloadEngine : IDisposable
 
     public void DeletePartialData(DownloadJob job)
     {
-        if (string.IsNullOrWhiteSpace(job.ResolvedTargetPath))
+        var plan = DownloadArtifactPlan.CreateFor(job);
+        if (plan is null)
         {
             return;
         }
 
-        var partsDirectory = PartsDirectory(job.ResolvedTargetPath);
-        if (Directory.Exists(partsDirectory))
+        var artifacts = ValidatePartialArtifacts(plan, job.SegmentCount);
+        DeletePartialArtifacts(plan, artifacts);
+        DiagnosticLog.Info("Engine", $"Partial data deleted; job={job.Id:N}; target={plan.TargetPath}");
+    }
+
+    public DownloadDataDeletionResult DeleteDownloadData(DownloadJob job)
+    {
+        var plan = DownloadArtifactPlan.CreateFor(job);
+        if (plan is null)
         {
-            Directory.Delete(partsDirectory, true);
+            return default;
         }
 
-        DeleteIfExists(TemporaryPath(job.ResolvedTargetPath));
-        DeleteIfExists(AssemblingPath(job.ResolvedTargetPath));
-        DiagnosticLog.Info("Engine", $"Partial data deleted; job={job.Id:N}; target={job.ResolvedTargetPath}");
+        return DeleteDownloadData([job], plan);
+    }
+
+    public DownloadDataDeletionResult DeleteDownloadData(
+        IReadOnlyCollection<DownloadJob> jobs,
+        DownloadArtifactPlan plan)
+    {
+        ArgumentNullException.ThrowIfNull(jobs);
+        ArgumentNullException.ThrowIfNull(plan);
+        if (jobs.Count == 0)
+        {
+            throw new ArgumentException("至少需要一个待删除任务。", nameof(jobs));
+        }
+
+        foreach (var job in jobs)
+        {
+            var currentPlan = DownloadArtifactPlan.CreateFor(job);
+            if (currentPlan is null
+                || !currentPlan.HasSameArtifacts(plan))
+            {
+                throw new IOException("任务文件的实际位置在确认后发生变化，已停止删除。");
+            }
+
+            ValidateRecordedTargetPath(currentPlan.TargetPath);
+        }
+
+        var artifacts = ValidatePartialArtifacts(plan, jobs.Max(job => job.SegmentCount));
+        var targetExists = ValidateTargetFile(plan.DeletionTargetPath);
+        var verifiedOwnership = targetExists && jobs.All(job =>
+            job.TargetFileOwnership == TargetFileOwnership.CreatedByDownloader
+            && PhysicalPathResolver.MatchesFileFingerprint(
+                plan.DeletionTargetPath,
+                job.TargetFileFingerprint));
+        var preserveTarget = targetExists && !verifiedOwnership;
+
+        if (targetExists && !preserveTarget)
+        {
+            _recycleTargetFile(plan.DeletionTargetPath);
+        }
+
+        DeletePartialArtifacts(plan, artifacts);
+        DiagnosticLog.Info(
+            "Engine",
+            $"Task data deleted; jobs={string.Join(',', jobs.Select(job => job.Id.ToString("N")))}; " +
+            $"target={plan.DeletionTargetPath}; " +
+            $"recycled={targetExists && !preserveTarget}; preservedExternal={preserveTarget}");
+        return new DownloadDataDeletionResult(
+            targetExists && !preserveTarget,
+            preserveTarget ? plan.DeletionTargetPath : null);
     }
 
     private async Task DownloadSegmentedAsync(
@@ -391,12 +475,11 @@ internal sealed class DownloadEngine : IDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        if (File.Exists(targetPath))
-        {
-            throw new IOException("目标文件已存在，下载结果保留在临时文件中。");
-        }
-
-        File.Move(temporaryPath, targetPath);
+        MoveIntoOwnedTarget(
+            temporaryPath,
+            targetPath,
+            job,
+            "目标文件已存在，下载结果保留在临时文件中。");
         progress.Report(new DownloadProgress(downloadedBytes, job.TotalBytes ?? downloadedBytes, 0));
         DiagnosticLog.Info("Engine", $"Single-stream download finalized; job={job.Id:N}; bytes={downloadedBytes}; target={targetPath}");
     }
@@ -486,12 +569,11 @@ internal sealed class DownloadEngine : IDisposable
             throw new IOException("合并后的文件长度与服务器报告不一致。");
         }
 
-        if (File.Exists(targetPath))
-        {
-            throw new IOException("目标文件已存在，合并结果已保留。");
-        }
-
-        File.Move(assemblingPath, targetPath);
+        MoveIntoOwnedTarget(
+            assemblingPath,
+            targetPath,
+            job,
+            "目标文件已存在，合并结果已保留。");
         Directory.Delete(partsDirectory, true);
         DiagnosticLog.Info("Engine", $"Merge completed; job={job.Id:N}; target={targetPath}");
     }
@@ -609,12 +691,252 @@ internal sealed class DownloadEngine : IDisposable
 
     private static string AssemblingPath(string targetPath) => targetPath + ".assembling";
 
+    private static ValidatedPartialArtifacts ValidatePartialArtifacts(
+        DownloadArtifactPlan plan,
+        int maximumPartCount)
+    {
+        ValidateRecordedTargetPath(plan.TargetPath);
+        ValidateRecordedArtifactPath(plan.PartsDirectory);
+        ValidateRecordedArtifactPath(plan.TemporaryPath);
+        ValidateRecordedArtifactPath(plan.AssemblingPath);
+        ValidateDestinationDirectory(plan.DeletionTargetPath);
+        var files = ValidatePartsDirectory(
+            plan.DeletionPartsDirectory,
+            maximumPartCount,
+            out var partsDirectoryExists).ToList();
+        if (ValidateSidecarFile(plan.DeletionTemporaryPath))
+        {
+            files.Add(plan.DeletionTemporaryPath);
+        }
+
+        if (ValidateSidecarFile(plan.DeletionAssemblingPath))
+        {
+            files.Add(plan.DeletionAssemblingPath);
+        }
+
+        return new ValidatedPartialArtifacts(partsDirectoryExists, files);
+    }
+
+    private static void ValidateRecordedTargetPath(string targetPath)
+    {
+        var attributes = GetAttributesIfExists(targetPath);
+        if (attributes is not null && (attributes.Value & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException($"任务目标是文件链接，为避免删除链接指向的文件，已停止操作：{targetPath}");
+        }
+    }
+
+    private static void ValidateRecordedArtifactPath(string path)
+    {
+        var attributes = GetAttributesIfExists(path);
+        if (attributes is not null && (attributes.Value & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException($"任务临时数据是文件链接，为避免误删已停止操作：{path}");
+        }
+    }
+
+    private static void DeletePartialArtifacts(
+        DownloadArtifactPlan plan,
+        ValidatedPartialArtifacts artifacts)
+    {
+        foreach (var file in artifacts.Files)
+        {
+            File.Delete(file);
+        }
+
+        if (artifacts.PartsDirectoryExists)
+        {
+            Directory.Delete(plan.DeletionPartsDirectory, false);
+        }
+    }
+
+    private static IReadOnlyList<string> ValidatePartsDirectory(
+        string partsDirectory,
+        int maximumPartCount,
+        out bool directoryExists)
+    {
+        var attributes = GetAttributesIfExists(partsDirectory);
+        if (attributes is null)
+        {
+            directoryExists = false;
+            return [];
+        }
+
+        if ((attributes.Value & FileAttributes.Directory) == 0)
+        {
+            throw new IOException($"预期的临时分块目录实际是文件，已停止删除：{partsDirectory}");
+        }
+
+        if ((attributes.Value & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException($"临时分块目录是链接，为避免误删已停止操作：{partsDirectory}");
+        }
+
+        directoryExists = true;
+        var entries = Directory.EnumerateFileSystemEntries(partsDirectory).ToList();
+        foreach (var entry in entries)
+        {
+            var entryAttributes = File.GetAttributes(entry);
+            if ((entryAttributes & FileAttributes.Directory) != 0
+                || (entryAttributes & FileAttributes.ReparsePoint) != 0
+                || !IsExpectedPartFileName(Path.GetFileName(entry), maximumPartCount))
+            {
+                throw new IOException($"临时分块目录中存在未知内容，已停止删除：{entry}");
+            }
+        }
+
+        return entries;
+    }
+
+    private static bool ValidateSidecarFile(string path)
+    {
+        var attributes = GetAttributesIfExists(path);
+        if (attributes is null)
+        {
+            return false;
+        }
+
+        if ((attributes.Value & FileAttributes.Directory) != 0)
+        {
+            throw new IOException($"预期的临时文件实际是文件夹，已停止删除：{path}");
+        }
+
+        if ((attributes.Value & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException($"临时文件是链接，为避免误删已停止操作：{path}");
+        }
+
+        return true;
+    }
+
+    private static void ValidateDestinationDirectory(string targetPath)
+    {
+        var destination = Path.GetDirectoryName(targetPath)
+            ?? throw new InvalidOperationException("任务的保存文件夹无效。");
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(destination);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            throw new IOException($"保存文件夹不存在或当前无法访问：{destination}", exception);
+        }
+
+        if ((attributes & FileAttributes.Directory) == 0)
+        {
+            throw new IOException($"任务的保存位置不是文件夹：{destination}");
+        }
+    }
+
+    private static bool ValidateTargetFile(string targetPath)
+    {
+        var attributes = GetAttributesIfExists(targetPath);
+        if (attributes is null)
+        {
+            return false;
+        }
+
+        if ((attributes.Value & FileAttributes.Directory) != 0)
+        {
+            throw new IOException($"目标文件路径实际是文件夹，已停止删除：{targetPath}");
+        }
+
+        if ((attributes.Value & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException($"目标文件是链接，为避免误删已停止操作：{targetPath}");
+        }
+
+        return true;
+    }
+
+    private static FileAttributes? GetAttributesIfExists(string path)
+    {
+        try
+        {
+            return File.GetAttributes(path);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsExpectedPartFileName(string fileName, int maximumPartCount)
+    {
+        const string prefix = "part-";
+        const string suffix = ".tmp";
+        if (!fileName.StartsWith(prefix, StringComparison.Ordinal)
+            || !fileName.EndsWith(suffix, StringComparison.Ordinal)
+            || fileName.Length != prefix.Length + 3 + suffix.Length)
+        {
+            return false;
+        }
+
+        var digits = fileName.AsSpan(prefix.Length, fileName.Length - prefix.Length - suffix.Length);
+        return int.TryParse(digits, out var index) && index >= 0 && index < maximumPartCount;
+    }
+
     private static void DeleteIfExists(string path)
     {
         if (File.Exists(path))
         {
             File.Delete(path);
         }
+    }
+
+    private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
+
+    private static void MoveIntoOwnedTarget(
+        string sourcePath,
+        string targetPath,
+        DownloadJob job,
+        string conflictMessage)
+    {
+        if (PathExists(targetPath))
+        {
+            job.TargetFileOwnership = TargetFileOwnership.ExistingFile;
+            job.TargetFileFingerprint = null;
+            throw new IOException(conflictMessage);
+        }
+
+        try
+        {
+            File.Move(sourcePath, targetPath);
+            TryMarkTargetAsDownloaderOwned(job, targetPath);
+        }
+        catch (IOException exception) when (PathExists(targetPath))
+        {
+            job.TargetFileOwnership = TargetFileOwnership.ExistingFile;
+            job.TargetFileFingerprint = null;
+            throw new IOException(conflictMessage, exception);
+        }
+    }
+
+    private static void TryMarkTargetAsDownloaderOwned(DownloadJob job, string targetPath)
+    {
+        try
+        {
+            job.TargetFileFingerprint = PhysicalPathResolver.GetFileFingerprint(targetPath);
+            job.TargetFileOwnership = TargetFileOwnership.CreatedByDownloader;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            job.TargetFileFingerprint = null;
+            job.TargetFileOwnership = TargetFileOwnership.Unknown;
+            DiagnosticLog.Warning(
+                "Engine",
+                $"Created target identity could not be recorded; job={job.Id:N}; target={targetPath}; error={exception.Message}");
+        }
+    }
+
+    private static void RecycleTargetFile(string targetPath)
+    {
+        FileSystem.DeleteFile(
+            targetPath,
+            UIOption.OnlyErrorDialogs,
+            RecycleOption.SendToRecycleBin,
+            UICancelOption.ThrowException);
     }
 
     public void Dispose()
