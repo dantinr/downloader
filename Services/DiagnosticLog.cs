@@ -15,10 +15,7 @@ internal static class DiagnosticLog
     private static DateOnly? _writerDate;
     private static string? _currentLogPath;
 
-    public static string LogsDirectory { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "downloader",
-        "logs");
+    public static string LogsDirectory { get; } = ApplicationDataPaths.LogsDirectory;
 
     public static string CurrentLogPath
     {

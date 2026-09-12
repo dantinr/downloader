@@ -15,7 +15,8 @@ using BigFileDownloader.Models;
 using BigFileDownloader.Services;
 using BigFileDownloader.Views;
 
-var root = Path.Combine(Path.GetTempPath(), $"downloader-selftest-{Guid.NewGuid():N}");
+var projectRoot = FindProjectRoot();
+var root = Path.Combine(projectRoot, "artifacts", "selftest-temp", $"downloader-selftest-{Guid.NewGuid():N}");
 Directory.CreateDirectory(root);
 
 try
@@ -26,9 +27,10 @@ try
     TestArtifactDeletion(root);
     TestArtifactPathAliases(root);
     await TestInterruptedDeletionRecoveryAsync(root);
+    TestPortableApplicationData(root);
     await TestSettingsStoreAsync(root);
     TestAppInfo();
-    TestUiRendering(root, Path.Combine(Environment.CurrentDirectory, "artifacts", "ui-review"));
+    TestUiRendering(root, Path.Combine(projectRoot, "artifacts", "ui-review"));
     Console.WriteLine("PASS: all self-tests completed.");
 }
 finally
@@ -510,6 +512,92 @@ static async Task TestInterruptedDeletionRecoveryAsync(string root)
     Console.WriteLine("  ok: interrupted deletion checkpoints recover without a false completed state");
 }
 
+static void TestPortableApplicationData(string root)
+{
+    var applicationBase = Path.GetFullPath(AppContext.BaseDirectory)
+        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+        + Path.DirectorySeparatorChar;
+    Assert(ApplicationDataPaths.RootDirectory.StartsWith(applicationBase, StringComparison.OrdinalIgnoreCase),
+        "default application data stays beside the executable");
+    Assert(ApplicationDataPaths.QueueFilePath.StartsWith(ApplicationDataPaths.RootDirectory, StringComparison.OrdinalIgnoreCase)
+        && ApplicationDataPaths.SettingsFilePath.StartsWith(ApplicationDataPaths.RootDirectory, StringComparison.OrdinalIgnoreCase)
+        && ApplicationDataPaths.LogsDirectory.StartsWith(ApplicationDataPaths.RootDirectory, StringComparison.OrdinalIgnoreCase),
+        "queue, settings, and logs share the portable data directory");
+    Assert(ApplicationDataPaths.DefaultDownloadDirectory.StartsWith(applicationBase, StringComparison.OrdinalIgnoreCase),
+        "a clean installation defaults downloads beside the executable");
+
+    var legacyRoot = Path.Combine(root, "legacy-local-app-data");
+    var legacyApplicationDirectory = Path.Combine(legacyRoot, "BigFileDownloader");
+    var legacyLogsDirectory = Path.Combine(legacyRoot, "downloader", "logs");
+    var destinationRoot = Path.Combine(root, "portable-application-data");
+    Directory.CreateDirectory(legacyApplicationDirectory);
+    Directory.CreateDirectory(legacyLogsDirectory);
+    Directory.CreateDirectory(destinationRoot);
+
+    File.WriteAllText(Path.Combine(legacyApplicationDirectory, "queue.json"), "legacy queue");
+    File.WriteAllText(Path.Combine(legacyApplicationDirectory, "settings.json"), "portable settings");
+    File.WriteAllText(Path.Combine(legacyLogsDirectory, "downloader-20260912.log"), "legacy log");
+    File.WriteAllText(Path.Combine(destinationRoot, "queue.json"), "current queue");
+
+    var migration = ApplicationDataPaths.MigrateLegacyData(legacyRoot, destinationRoot);
+    Assert(migration.MigratedFileCount == 3 && migration.Warnings.Count == 0 && !migration.HasBlockingFailure,
+        "legacy application files migrate without data loss warnings");
+    Assert(File.ReadAllText(Path.Combine(destinationRoot, "queue.json")) == "current queue",
+        "an existing portable queue remains authoritative during migration");
+    var legacyQueueBackups = Directory.GetFiles(destinationRoot, "queue.legacy-*.json");
+    Assert(legacyQueueBackups.Length == 1 && File.ReadAllText(legacyQueueBackups[0]) == "legacy queue",
+        "a conflicting legacy queue is retained as a portable backup");
+    Assert(File.ReadAllText(Path.Combine(destinationRoot, "settings.json")) == "portable settings"
+        && File.ReadAllText(Path.Combine(destinationRoot, "logs", "downloader-20260912.log")) == "legacy log",
+        "settings and logs move into the portable data directory");
+    Assert(!Directory.Exists(legacyApplicationDirectory)
+        && !Directory.Exists(legacyLogsDirectory)
+        && !Directory.Exists(Path.Combine(legacyRoot, "downloader")),
+        "empty legacy application directories are removed after migration");
+
+    var recoveryLegacyRoot = Path.Combine(root, "recovery-local-app-data");
+    var recoveryLegacyApplicationDirectory = Path.Combine(recoveryLegacyRoot, "BigFileDownloader");
+    var recoveryDestinationRoot = Path.Combine(root, "recovery-portable-application-data");
+    Directory.CreateDirectory(recoveryLegacyApplicationDirectory);
+    Directory.CreateDirectory(recoveryDestinationRoot);
+    File.WriteAllText(Path.Combine(recoveryLegacyApplicationDirectory, "queue.json"), "[{\"id\":\"legacy-task\"}]");
+    File.WriteAllText(Path.Combine(recoveryDestinationRoot, "queue.json"), "[]");
+
+    var recoveryMigration = ApplicationDataPaths.MigrateLegacyData(recoveryLegacyRoot, recoveryDestinationRoot);
+    Assert(!recoveryMigration.HasBlockingFailure
+        && File.ReadAllText(Path.Combine(recoveryDestinationRoot, "queue.json")).Contains("legacy-task"),
+        "a non-empty legacy queue replaces an empty portable queue after an interrupted migration");
+    var emptyQueueBackups = Directory.GetFiles(recoveryDestinationRoot, "queue.legacy-*.json");
+    Assert(emptyQueueBackups.Length == 1 && File.ReadAllText(emptyQueueBackups[0]) == "[]",
+        "the replaced empty portable queue remains available as a migration backup");
+
+    var lockedLegacyRoot = Path.Combine(root, "locked-local-app-data");
+    var lockedLegacyApplicationDirectory = Path.Combine(lockedLegacyRoot, "BigFileDownloader");
+    var lockedDestinationRoot = Path.Combine(root, "locked-portable-application-data");
+    Directory.CreateDirectory(lockedLegacyApplicationDirectory);
+    Directory.CreateDirectory(lockedDestinationRoot);
+    var lockedQueuePath = Path.Combine(lockedLegacyApplicationDirectory, "queue.json");
+    File.WriteAllText(lockedQueuePath, "[{\"id\":\"locked-legacy-task\"}]");
+    File.WriteAllText(Path.Combine(lockedDestinationRoot, "queue.json"), "[]");
+    using (File.Open(lockedQueuePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        var blockedMigration = ApplicationDataPaths.MigrateLegacyData(lockedLegacyRoot, lockedDestinationRoot);
+        Assert(blockedMigration.HasBlockingFailure && blockedMigration.Warnings.Count == 1,
+            "a locked legacy queue blocks startup even when a portable queue already exists");
+    }
+
+    var retriedMigration = ApplicationDataPaths.MigrateLegacyData(lockedLegacyRoot, lockedDestinationRoot);
+    Assert(!retriedMigration.HasBlockingFailure
+        && File.ReadAllText(Path.Combine(lockedDestinationRoot, "queue.json")).Contains("locked-legacy-task"),
+        "a blocked migration succeeds without data loss after the legacy queue is released");
+
+    var repeatedMigration = ApplicationDataPaths.MigrateLegacyData(legacyRoot, destinationRoot);
+    Assert(repeatedMigration.MigratedFileCount == 0 && repeatedMigration.Warnings.Count == 0,
+        "portable data migration is idempotent");
+
+    Console.WriteLine("  ok: application data is portable and legacy files migrate safely");
+}
+
 static async Task TestSettingsStoreAsync(string root)
 {
     var settingsPath = Path.Combine(root, "settings", "settings.json");
@@ -534,7 +622,7 @@ static async Task TestSettingsStoreAsync(string root)
         "{\"schemaVersion\":99,\"defaultDownloadDirectory\":\"C:\\\\future-downloads\"}";
     await File.WriteAllTextAsync(settingsPath, futureSettings);
     var futureFallback = await store.LoadAsync();
-    Assert(futureFallback.DefaultDownloadDirectory == KnownFolders.DownloadsDirectory,
+    Assert(futureFallback.DefaultDownloadDirectory == ApplicationDataPaths.DefaultDownloadDirectory,
         "an unknown settings schema falls back to Downloads");
     Assert(await File.ReadAllTextAsync(settingsPath) == futureSettings,
         "an unknown settings schema is not overwritten");
@@ -542,7 +630,7 @@ static async Task TestSettingsStoreAsync(string root)
     const string invalidSettings = "{not-valid-json";
     await File.WriteAllTextAsync(settingsPath, invalidSettings);
     var invalidFallback = await store.LoadAsync();
-    Assert(invalidFallback.DefaultDownloadDirectory == KnownFolders.DownloadsDirectory,
+    Assert(invalidFallback.DefaultDownloadDirectory == ApplicationDataPaths.DefaultDownloadDirectory,
         "invalid settings fall back to Downloads");
     Assert(await File.ReadAllTextAsync(settingsPath) == invalidSettings,
         "invalid settings are preserved for diagnostics");
@@ -576,7 +664,7 @@ static void TestUiRendering(string testRoot, string outputDirectory)
             var firstJob = new DownloadJob
             {
                 FileName = "existing-download.bin",
-                DestinationFolder = KnownFolders.DownloadsDirectory,
+                DestinationFolder = ApplicationDataPaths.DefaultDownloadDirectory,
                 TotalBytes = 1_000,
                 DownloadedBytes = 500,
                 State = DownloadState.Paused,
@@ -585,7 +673,7 @@ static void TestUiRendering(string testRoot, string outputDirectory)
             var secondJob = new DownloadJob
             {
                 FileName = "second-download.bin",
-                DestinationFolder = KnownFolders.DownloadsDirectory,
+                DestinationFolder = ApplicationDataPaths.DefaultDownloadDirectory,
                 TotalBytes = 2_000,
                 DownloadedBytes = 250,
                 State = DownloadState.Failed,
@@ -655,7 +743,7 @@ static void TestUiRendering(string testRoot, string outputDirectory)
 
             RenderWindow(
                 new SettingsWindow(Path.Combine(
-                    KnownFolders.DownloadsDirectory,
+                    ApplicationDataPaths.DefaultDownloadDirectory,
                     "long-folder-name-for-layout-review",
                     "downloads")),
                 Path.Combine(outputDirectory, "settings.png"));
@@ -749,6 +837,19 @@ static void RenderWindow(Window window, string outputPath)
     }
 
     Assert(new FileInfo(outputPath).Length > 1000, $"{window.Title} produces a non-empty UI snapshot");
+}
+
+static string FindProjectRoot()
+{
+    for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+    {
+        if (File.Exists(Path.Combine(directory.FullName, "BigFileDownloader.csproj")))
+        {
+            return directory.FullName;
+        }
+    }
+
+    throw new DirectoryNotFoundException("无法定位 BigFileDownloader 项目目录。");
 }
 
 static DownloadJob NewPartialJob(string targetPath, long totalBytes) => new()

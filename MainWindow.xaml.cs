@@ -34,7 +34,7 @@ public partial class MainWindow : Window
     private readonly SettingsStore _settingsStore = new();
     private readonly SemaphoreSlim _queueSaveGate = new(1, 1);
     private readonly DispatcherTimer _saveTimer;
-    private AppSettings _settings = AppSettings.CreateDefault(KnownFolders.DownloadsDirectory);
+    private AppSettings _settings = AppSettings.CreateDefault(ApplicationDataPaths.DefaultDownloadDirectory);
     private Task? _initializationTask;
     private bool _queueDirty;
     private bool _isLoaded;

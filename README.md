@@ -1,6 +1,6 @@
 # downloader
 
-一个面向 Windows 的直接文件下载工具，适合 ISO、压缩包、视频素材等大文件。
+一个面向 Windows 10/11 x64（64 位）系统的直接文件下载工具，适合 ISO、压缩包、视频素材等大文件。不支持 Windows 7、Windows 8/8.1、x86 或原生 ARM64 版本。
 
 ## 功能
 
@@ -13,6 +13,8 @@
 - 可手动整合两个同文件任务，逐字节验证重复进度后保留较完整任务并转移可用链接
 - 任务列表右键可打开文件位置、仅删除任务记录，或连同成品和临时数据一起删除
 - 可在设置中持久化新任务的默认下载位置
+- 设置、任务记录和日志保存在程序旁的 `data` 目录，不占用系统盘用户数据目录
+- 从 `Release\start-downloader.cmd` 启动时，.NET 单文件解包缓存也会写入项目的 `.cache` 目录
 - 标题栏显示当前版本，并提供版本、协议和项目地址信息
 - 任务列表自动保存，程序重启后可以继续
 - 自动避开同名文件，不覆盖已有文件
@@ -46,7 +48,9 @@ dotnet publish .\BigFileDownloader.csproj -p:PublishProfile=win-x64
 
 ## 诊断日志
 
-日志保存在 `%LocalAppData%\downloader\logs`，文件名为 `downloader-yyyyMMdd.log`。工具栏中的文档图标可以直接打开当天日志。日志不会记录 URL 查询参数，避免暴露临时 CDN 签名。
+日志保存在程序旁的 `data\logs`，文件名为 `downloader-yyyyMMdd.log`。任务记录和设置分别保存在 `data\queue.json` 与 `data\settings.json`。从旧版本升级时，原 `%LocalAppData%` 数据会在首次启动时校验并迁移到便携目录。工具栏中的文档图标可以直接打开当天日志。日志不会记录 URL 查询参数，避免暴露临时 CDN 签名。
+
+Windows 上的 .NET 单文件程序默认会把原生运行库解包到 `%TEMP%\.net`。需要完全避免占用系统盘时，请使用 `Release\start-downloader.cmd` 启动；该入口会在启动 EXE 前把解包目录重定向到项目内的 `.cache\dotnet-bundle`。
 
 ## 限制
 

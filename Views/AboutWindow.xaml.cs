@@ -17,6 +17,7 @@ public partial class AboutWindow : Window
         DescriptionText.Text = AppInfo.Description;
         LicenseText.Text = AppInfo.LicenseName;
         RepositoryText.Text = AppInfo.RepositoryUrl;
+        SystemRequirementsText.Text = AppInfo.SystemRequirements;
         Loaded += (_, _) => CloseButton.Focus();
     }
 

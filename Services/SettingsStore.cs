@@ -16,15 +16,12 @@ internal sealed class SettingsStore
 
     public SettingsStore(string? filePath = null)
     {
-        _filePath = filePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "BigFileDownloader",
-            "settings.json");
+        _filePath = filePath ?? ApplicationDataPaths.SettingsFilePath;
     }
 
     public async Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default)
     {
-        var fallback = AppSettings.CreateDefault(KnownFolders.DownloadsDirectory);
+        var fallback = AppSettings.CreateDefault(ApplicationDataPaths.DefaultDownloadDirectory);
         if (!File.Exists(_filePath))
         {
             DiagnosticLog.Info("Settings", $"No saved settings found; path={_filePath}");

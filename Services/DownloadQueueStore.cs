@@ -17,10 +17,7 @@ internal sealed class DownloadQueueStore
 
     public DownloadQueueStore(string? filePath = null)
     {
-        _filePath = filePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "BigFileDownloader",
-            "queue.json");
+        _filePath = filePath ?? ApplicationDataPaths.QueueFilePath;
     }
 
     public async Task<IReadOnlyList<DownloadJob>> LoadAsync(CancellationToken cancellationToken = default)

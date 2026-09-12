@@ -7,14 +7,12 @@ namespace BigFileDownloader;
 
 public partial class App : Application
 {
-    private static readonly string SingleInstanceMutexName = BuildSingleInstanceMutexName();
     private Mutex? _singleInstanceMutex;
     private bool _ownsSingleInstanceMutex;
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        DiagnosticLog.Initialize();
-        _singleInstanceMutex = new Mutex(initiallyOwned: false, SingleInstanceMutexName);
+        _singleInstanceMutex = new Mutex(initiallyOwned: false, BuildSingleInstanceMutexName());
         try
         {
             _ownsSingleInstanceMutex = _singleInstanceMutex.WaitOne(0);
@@ -26,6 +24,7 @@ public partial class App : Application
 
         if (!_ownsSingleInstanceMutex)
         {
+            DiagnosticLog.Initialize();
             DiagnosticLog.Warning("App", "A second application instance was blocked");
             MessageBox.Show(
                 "downloader 已在运行，请切换到已有窗口。",
@@ -33,6 +32,33 @@ public partial class App : Application
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
             Shutdown();
+            return;
+        }
+
+        var migration = ApplicationDataPaths.MigrateLegacyData();
+        DiagnosticLog.Initialize();
+        if (migration.MigratedFileCount > 0)
+        {
+            DiagnosticLog.Info(
+                "App",
+                $"Legacy application data moved to portable storage; files={migration.MigratedFileCount}; " +
+                $"directory={ApplicationDataPaths.RootDirectory}");
+        }
+
+        foreach (var warning in migration.Warnings)
+        {
+            DiagnosticLog.Warning("App", warning);
+        }
+
+        if (migration.HasBlockingFailure)
+        {
+            DiagnosticLog.Warning("App", "Startup stopped because legacy application data could not be migrated");
+            MessageBox.Show(
+                $"旧版任务或设置无法迁移。为避免覆盖原数据，downloader 已停止启动。\n\n请检查数据目录：\n{ApplicationDataPaths.RootDirectory}",
+                AppInfo.WindowTitle,
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(1);
             return;
         }
 

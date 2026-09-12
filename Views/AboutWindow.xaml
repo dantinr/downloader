@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="关于"
         Width="500"
-        Height="328"
+        Height="350"
         MinWidth="480"
         MinHeight="300"
         ResizeMode="CanResizeWithGrip"
@@ -51,6 +51,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="88" />
@@ -66,6 +67,12 @@
                        FontSize="12"
                        TextTrimming="CharacterEllipsis"
                        ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            <TextBlock Grid.Row="2" Text="系统要求" FontSize="12" Foreground="{StaticResource MutedTextBrush}" Margin="0,12,0,0" />
+            <TextBlock Grid.Row="2"
+                       Grid.Column="1"
+                       x:Name="SystemRequirementsText"
+                       Margin="0,12,0,0"
+                       FontSize="12" />
         </Grid>
 
         <Grid Grid.Row="8">

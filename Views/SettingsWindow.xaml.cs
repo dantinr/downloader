@@ -34,7 +34,7 @@ public partial class SettingsWindow : Window
             Title = "选择默认下载位置",
             InitialDirectory = Directory.Exists(DefaultDirectoryBox.Text)
                 ? DefaultDirectoryBox.Text
-                : KnownFolders.DownloadsDirectory
+                : ApplicationDataPaths.DefaultDownloadDirectory
         };
 
         if (dialog.ShowDialog(this) == true)
@@ -46,7 +46,7 @@ public partial class SettingsWindow : Window
 
     private void RestoreDefaultButton_Click(object sender, RoutedEventArgs e)
     {
-        DefaultDirectoryBox.Text = KnownFolders.DownloadsDirectory;
+        DefaultDirectoryBox.Text = ApplicationDataPaths.DefaultDownloadDirectory;
         DefaultDirectoryBox.Focus();
         DefaultDirectoryBox.CaretIndex = DefaultDirectoryBox.Text.Length;
     }
